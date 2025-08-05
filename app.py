@@ -44,31 +44,42 @@ def transcribe_vosk(audio_file):
     except Exception as e:
         return f"VOSK transcription error: {str(e)}"
 
-def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5):
+def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None):
     try:
+        # Prepare generation parameters
+        generation_params = {
+            "exaggeration": exaggeration,
+            "cfg_weight": cfg_weight,
+            "temperature": temperature
+        }
+        if random_seed is not None:
+            torch.manual_seed(random_seed)  # Set seed for reproducibility if provided
+
         if audio_prompt:
-            wav = chatterbox_model.generate(text, audio_prompt_path=audio_prompt, exaggeration=exaggeration, cfg_weight=cfg_weight)
+            wav = chatterbox_model.generate(text, audio_prompt_path=audio_prompt, **generation_params)
         else:
-            wav = chatterbox_model.generate(text, exaggeration=exaggeration, cfg_weight=cfg_weight)
+            wav = chatterbox_model.generate(text, **generation_params)
         output_path = "output_audio.wav"
         torchaudio.save(output_path, wav, chatterbox_model.sr)
         return output_path
     except Exception as e:
         return f"Chatterbox cloning error: {str(e)}"
 
-# Gradio Interface
+# Gradio Interface with custom endpoint names and new parameters
 whisper_iface = gr.Interface(
     fn=transcribe_whisper,
     inputs=gr.Audio(type="filepath", label="Upload audio for Whisper transcription"),
     outputs="text",
-    title="OpenAI Whisper Turbo Transcription"
+    title="OpenAI Whisper Turbo Transcription",
+    api_name="/whisper"
 )
 
 vosk_iface = gr.Interface(
     fn=transcribe_vosk,
     inputs=gr.Audio(type="filepath", label="Upload audio for VOSK transcription"),
     outputs="text",
-    title="VOSK Transcription"
+    title="VOSK Transcription",
+    api_name="/vosk"
 )
 
 chatterbox_iface = gr.Interface(
@@ -77,10 +88,13 @@ chatterbox_iface = gr.Interface(
         gr.Textbox(label="Text to clone"),
         gr.Audio(type="filepath", label="Reference audio (optional for voice cloning)"),
         gr.Slider(minimum=0, maximum=1, value=0.5, label="Exaggeration (emotion intensity)"),
-        gr.Slider(minimum=0, maximum=1, value=0.5, label="CFG Weight (pacing control)")
+        gr.Slider(minimum=0, maximum=1, value=0.5, label="CFG Weight (pacing control)"),
+        gr.Slider(minimum=0.1, maximum=2.0, value=1.0, label="Temperature"),
+        gr.Number(label="Random Seed", value=None, precision=0)
     ],
     outputs=gr.Audio(type="filepath", label="Generated Audio"),
-    title="Resemble.AI Chatterbox Voice Cloning"
+    title="Resemble.AI Chatterbox Voice Cloning",
+    api_name="/chatterbox"
 )
 
 app = gr.TabbedInterface([whisper_iface, vosk_iface, chatterbox_iface], ["Whisper", "VOSK", "Chatterbox"])
