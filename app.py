@@ -71,7 +71,7 @@ whisper_iface = gr.Interface(
     inputs=gr.Audio(type="filepath", label="Upload audio for Whisper transcription"),
     outputs="text",
     title="OpenAI Whisper Turbo Transcription",
-    api_name="/whisper"
+    api_name="whisper"
 )
 
 vosk_iface = gr.Interface(
@@ -79,7 +79,7 @@ vosk_iface = gr.Interface(
     inputs=gr.Audio(type="filepath", label="Upload audio for VOSK transcription"),
     outputs="text",
     title="VOSK Transcription",
-    api_name="/vosk"
+    api_name="vosk"
 )
 
 chatterbox_iface = gr.Interface(
@@ -94,7 +94,7 @@ chatterbox_iface = gr.Interface(
     ],
     outputs=gr.Audio(type="filepath", label="Generated Audio"),
     title="Resemble.AI Chatterbox Voice Cloning",
-    api_name="/chatterbox"
+    api_name="chatterbox"
 )
 
 app = gr.TabbedInterface([whisper_iface, vosk_iface, chatterbox_iface], ["Whisper", "VOSK", "Chatterbox"])
