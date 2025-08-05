@@ -17,7 +17,8 @@ RUN pip install --no-cache-dir \
     torch \
     torchaudio \
     librosa \
-    chatterbox-tts
+    chatterbox-tts \
+    peft
 
 # Set working directory
 WORKDIR /app
