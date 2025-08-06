@@ -1,5 +1,5 @@
-# Use a CUDA-enabled base image with Ubuntu 22.04
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+# Extend the RunPod PyTorch image
+FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04-test
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -7,19 +7,9 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     unzip \
-    python3 \
-    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install cuDNN 9.1.0 for CUDA 12.x
-RUN curl -O https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.1.0.70_cuda12-archive.tar.xz \
-    && tar -xf cudnn-linux-x86_64-9.1.0.70_cuda12-archive.tar.xz \
-    && cp cudnn-*/lib/* /usr/local/cuda/lib64/ \
-    && cp cudnn-*/include/* /usr/local/cuda/include/ \
-    && chmod a+r /usr/local/cuda/lib64/libcudnn*.so* \
-    && rm -rf cudnn-linux-x86_64-9.1.0.70_cuda12-archive.tar.xz cudnn-*
-
-# Set LD_LIBRARY_PATH for cuDNN
+# Verify and set LD_LIBRARY_PATH for cuDNN
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
 # Install Python dependencies
@@ -31,12 +21,11 @@ RUN pip install --no-cache-dir \
     vosk \
     gradio \
     numpy==1.26.4 \
-    torch==2.6.0+cu124 \
-    torchaudio==2.6.0+cu124 \
+    torchaudio==2.8.0+cu128 \
     librosa \
     chatterbox-tts \
     peft \
-    --extra-index-url https://download.pytorch.org/whl/cu124
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
 # Set working directory
 WORKDIR /app
