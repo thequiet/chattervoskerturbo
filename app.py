@@ -1,5 +1,5 @@
 import gradio as gr
-import whisper
+from faster_whisper import WhisperModel
 from vosk import Model, KaldiRecognizer
 import json
 import wave
@@ -10,9 +10,10 @@ import torchaudio
 from chatterbox.tts import ChatterboxTTS
 
 # Load models
-whisper_model = whisper.load_model("turbo")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+whisper_model = WhisperModel("turbo", device=device, compute_type="float16" if device == "cuda" else "int8")
 vosk_model_path = "/app/models/vosk-model-en-us-0.22"
-chatterbox_model = ChatterboxTTS.from_pretrained(device="cuda" if torch.cuda.is_available() else "cpu")
+chatterbox_model = ChatterboxTTS.from_pretrained(device=device)
 
 if os.path.exists(vosk_model_path):
     vosk_model = Model(vosk_model_path)
@@ -21,28 +22,68 @@ else:
 
 def transcribe_whisper(audio_file):
     try:
-        result = whisper_model.transcribe(audio_file)
-        return result["text"]
+        segments, info = whisper_model.transcribe(audio_file, beam_size=5, word_timestamps=True)
+        
+        # Convert to format similar to original whisper
+        result = {
+            "text": "",
+            "segments": [],
+            "language": info.language,
+            "language_probability": info.language_probability
+        }
+        
+        for segment in segments:
+            segment_dict = {
+                "id": segment.id,
+                "seek": segment.seek,
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text,
+                "tokens": segment.tokens,
+                "temperature": segment.temperature,
+                "avg_logprob": segment.avg_logprob,
+                "compression_ratio": segment.compression_ratio,
+                "no_speech_prob": segment.no_speech_prob
+            }
+            if hasattr(segment, 'words') and segment.words:
+                segment_dict["words"] = [
+                    {
+                        "word": word.word,
+                        "start": word.start,
+                        "end": word.end,
+                        "probability": word.probability
+                    }
+                    for word in segment.words
+                ]
+            result["segments"].append(segment_dict)
+            result["text"] += segment.text
+        
+        return result
     except Exception as e:
         return f"Whisper transcription error: {str(e)}"
 
-def transcribe_vosk(audio_file):
+def transcribe_vosk(audio_file, sample_rate=16000):
     try:
-        wf = wave.open(audio_file, "rb")
-        if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() not in [16000, 44100]:
-            return "VOSK requires mono WAV audio with 16-bit depth and 16kHz or 44.1kHz sample rate"
-        recognizer = KaldiRecognizer(vosk_model, wf.getframerate())
-        result = ""
-        while True:
-            data = wf.readframes(4000)
-            if len(data) == 0:
-                break
-            if recognizer.AcceptWaveform(data):
-                result += json.loads(recognizer.Result())["text"] + " "
-        result += json.loads(recognizer.FinalResult())["text"]
-        return result.strip()
+        # Initialize the recognizer with the model
+        recognizer = KaldiRecognizer(vosk_model, sample_rate)
+        recognizer.SetWords(True)
+        
+        # Open the audio file
+        with open(audio_file, "rb") as audio:
+            while True:
+                # Read a chunk of the audio file
+                data = audio.read(4000)
+                if len(data) == 0:
+                    break
+                # Recognize the speech in the chunk
+                recognizer.AcceptWaveform(data)
+
+        result = recognizer.FinalResult()
+        result_dict = json.loads(result)
+
+        return result_dict
     except Exception as e:
-        return f"VOSK transcription error: {str(e)}"
+        return {"error": f"VOSK transcription error: {str(e)}"}
 
 def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None):
     try:
@@ -69,15 +110,18 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
 whisper_iface = gr.Interface(
     fn=transcribe_whisper,
     inputs=gr.Audio(type="filepath", label="Upload audio for Whisper transcription"),
-    outputs="text",
+    outputs=gr.JSON(label="Whisper Result"),
     title="OpenAI Whisper Turbo Transcription",
     api_name="whisper"
 )
 
 vosk_iface = gr.Interface(
     fn=transcribe_vosk,
-    inputs=gr.Audio(type="filepath", label="Upload audio for VOSK transcription"),
-    outputs="text",
+    inputs=[
+        gr.Audio(type="filepath", label="Upload audio for VOSK transcription"),
+        gr.Number(label="Sample Rate", value=16000, precision=0)
+    ],
+    outputs=gr.JSON(label="VOSK Result"),
     title="VOSK Transcription",
     api_name="vosk"
 )
