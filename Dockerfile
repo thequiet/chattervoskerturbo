@@ -7,25 +7,36 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     unzip \
+    build-essential \
+    gcc \
+    g++ \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
-# Verify and set LD_LIBRARY_PATH for cuDNN
+# Install cuDNN 9.1.0 for CUDA 12.x
+RUN curl -O https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.1.0.70_cuda12-archive.tar.xz \
+    && tar -xf cudnn-linux-x86_64-9.1.0.70_cuda12-archive.tar.xz \
+    && cp cudnn-*/lib/* /usr/local/cuda/lib64/ \
+    && cp cudnn-*/include/* /usr/local/cuda/include/ \
+    && chmod a+r /usr/local/cuda/lib64/libcudnn*.so* \
+    && rm -rf cudnn-linux-x86_64-9.1.0.70_cuda12-archive.tar.xz cudnn-*
+
+# Set LD_LIBRARY_PATH for cuDNN
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-# Install Python dependencies
+# Install Python dependencies sequentially
 RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir numpy==1.26.4
+RUN pip install --no-cache-dir torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+RUN pip install --no-cache-dir ctranslate2==4.4.0
+RUN pip install --no-cache-dir faster-whisper==1.1.0
 RUN pip install --no-cache-dir \
     git+https://github.com/openai/whisper.git \
-    faster-whisper==1.1.0 \
-    ctranslate2==4.4.0 \
     vosk \
     gradio \
-    numpy==1.26.4 \
-    torchaudio==2.8.0+cu128 \
     librosa \
     chatterbox-tts \
-    peft \
-    --extra-index-url https://download.pytorch.org/whl/cu128
+    peft
 
 # Set working directory
 WORKDIR /app
