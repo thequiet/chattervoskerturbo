@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed to DEBUG for more verbose output
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -24,6 +24,14 @@ RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY")
 NETWORK_VOLUME_ID = os.environ.get("RUNPOD_NETWORK_VOLUME_ID", "inmf69hxr7")
 DATA_CENTER_REGION = os.environ.get("RUNPOD_DATA_CENTER_REGION", "US-IL-1")
 MOUNT_PATH = os.environ.get("RUNPOD_MOUNT_PATH", "/network-storage")
+
+# Log configuration values
+logger.info("=== RunPod Configuration ===")
+logger.info(f"NETWORK_VOLUME_ID: {NETWORK_VOLUME_ID}")
+logger.info(f"DATA_CENTER_REGION: {DATA_CENTER_REGION}")
+logger.info(f"MOUNT_PATH: {MOUNT_PATH}")
+logger.info(f"API_KEY present: {'Yes' if RUNPOD_API_KEY else 'No'}")
+logger.info("===============================")
 
 class RunPodNetworkVolumeManager:
     def __init__(self, api_key: str):
@@ -41,16 +49,23 @@ class RunPodNetworkVolumeManager:
             if variables:
                 payload["variables"] = variables
             
+            logger.debug(f"API Request payload: {json.dumps(payload, indent=2)}")
+            
             response = requests.post(
                 self.base_url,
                 headers=self.headers,
                 json=payload,
                 timeout=30
             )
+            
+            logger.debug(f"API Response status: {response.status_code}")
+            logger.debug(f"API Response text: {response.text}")
+            
             response.raise_for_status()
             return response.json()
         except Exception as e:
             logger.error(f"RunPod API request failed: {e}")
+            logger.error(f"Response content: {getattr(e.response, 'text', 'No response content') if hasattr(e, 'response') else 'No response object'}")
             return None
     
     def get_pod_id(self) -> Optional[str]:
@@ -78,11 +93,16 @@ class RunPodNetworkVolumeManager:
             logger.error("Could not determine pod ID")
             return False
         
+        # Try the new GraphQL mutation format first
         query = """
         mutation mountNetworkVolume($input: MountNetworkVolumeInput!) {
             mountNetworkVolume(input: $input) {
                 id
                 status
+                errors {
+                    message
+                    field
+                }
             }
         }
         """
@@ -91,19 +111,51 @@ class RunPodNetworkVolumeManager:
             "input": {
                 "podId": pod_id,
                 "networkVolumeId": volume_id,
-                "mountPath": mount_path
+                "mountPath": mount_path,
+                "dataCenterRegion": DATA_CENTER_REGION
             }
         }
         
-        logger.info(f"Mounting network volume {volume_id} to {mount_path}")
+        logger.info(f"Mounting network volume {volume_id} to {mount_path} in region {DATA_CENTER_REGION}")
+        logger.info(f"Pod ID: {pod_id}")
         result = self._make_request(query, variables)
         
         if result and not result.get("errors"):
+            mount_result = result.get("data", {}).get("mountNetworkVolume", {})
+            if mount_result.get("errors"):
+                logger.error(f"Mount operation returned errors: {mount_result['errors']}")
+                return False
             logger.info("Network volume mount request submitted successfully")
             return self._wait_for_mount(mount_path)
         else:
             logger.error(f"Failed to mount network volume: {result}")
-            return False
+            
+            # Try alternative mutation format without dataCenterRegion
+            logger.info("Trying alternative mutation format...")
+            query_alt = """
+            mutation mountNetworkVolume($input: MountNetworkVolumeInput!) {
+                mountNetworkVolume(input: $input) {
+                    id
+                    status
+                }
+            }
+            """
+            
+            variables_alt = {
+                "input": {
+                    "podId": pod_id,
+                    "networkVolumeId": volume_id,
+                    "mountPath": mount_path
+                }
+            }
+            
+            result_alt = self._make_request(query_alt, variables_alt)
+            if result_alt and not result_alt.get("errors"):
+                logger.info("Network volume mount request submitted successfully (alternative format)")
+                return self._wait_for_mount(mount_path)
+            else:
+                logger.error(f"Alternative mount request also failed: {result_alt}")
+                return False
     
     def _wait_for_mount(self, mount_path: str, timeout: int = 300) -> bool:
         """Wait for network volume to be mounted"""
