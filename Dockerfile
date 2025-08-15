@@ -35,7 +35,7 @@ WORKDIR /app
 # Copy application code and scripts
 COPY app.py /app/app.py
 COPY pod_shutdown.py /app/pod_shutdown.py
-COPY download_models_new.sh /app/download_models.sh
+COPY download_models.sh /app/download_models.sh
 COPY setup_network_volume.py /app/setup_network_volume.py
 COPY stop_inactive_pod.py /app/stop_inactive_pod.py
 COPY start.sh /app/start.sh
