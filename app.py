@@ -18,6 +18,9 @@ from chatterbox.tts import ChatterboxTTS
 import boto3
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
 from pod_shutdown import perform_pod_shutdown
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import queue
 
 # Configure enhanced logging
 logging.basicConfig(
@@ -49,6 +52,15 @@ logger.info("Starting ChatterVosker Application")
 logger.info(f"Python version: {sys.version}")
 logger.info(f"Start time: {datetime.now()}")
 logger.info("="*50)
+
+# Configuration settings
+SKIP_AUDIO_CONVERSION = os.environ.get("SKIP_AUDIO_CONVERSION", "true").lower() in ("true", "1", "yes")
+logger.info(f"Skip audio conversion: {SKIP_AUDIO_CONVERSION}")
+
+# Initialize S3 upload thread pool
+S3_UPLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=5, thread_name_prefix="s3-upload")
+S3_UPLOAD_FUTURES = queue.Queue()
+logger.info("Initialized S3 upload thread pool with 5 workers")
 
 # Load models
 logger.info("Initializing models...")
@@ -93,10 +105,14 @@ vosk_model = None
 network_storage_path = os.environ.get("RUNPOD_MOUNT_PATH", "/network-storage")
 network_vosk_path = f"{network_storage_path}/models/vosk-model-en-us-0.22"
 local_vosk_path = "/app/models/vosk-model-en-us-0.22"
+workspace_vosk_path = "/workspace/models/vosk-model-en-us-0.22"
 
-# Determine which VOSK model path to use
+# Determine which VOSK model path to use (check in priority order)
 vosk_model_path = None
-if os.path.exists(network_vosk_path) and os.path.exists(f"{network_vosk_path}/am/final.mdl"):
+if os.path.exists(workspace_vosk_path) and os.path.exists(f"{workspace_vosk_path}/am/final.mdl"):
+    vosk_model_path = workspace_vosk_path
+    logger.info(f"Using VOSK model from workspace: {vosk_model_path}")
+elif os.path.exists(network_vosk_path) and os.path.exists(f"{network_vosk_path}/am/final.mdl"):
     vosk_model_path = network_vosk_path
     logger.info(f"Using VOSK model from network storage: {vosk_model_path}")
 elif os.path.exists(local_vosk_path) and os.path.exists(f"{local_vosk_path}/am/final.mdl"):
@@ -114,12 +130,14 @@ if vosk_model_path:
         logger.warning("VOSK transcription will be disabled.")
         vosk_model = None
 else:
-    logger.warning(f"VOSK model not found at {network_vosk_path} or {local_vosk_path}. Attempting to download...")
+    logger.warning(f"VOSK model not found at {workspace_vosk_path}, {network_vosk_path}, or {local_vosk_path}. Attempting to download...")
     try:
         result = subprocess.run(["/app/download_models.sh"], capture_output=True, text=True)
         if result.returncode == 0:
-            # Check again for model after download
-            if os.path.exists(f"{network_vosk_path}/am/final.mdl"):
+            # Check again for model after download (check in priority order)
+            if os.path.exists(f"{workspace_vosk_path}/am/final.mdl"):
+                vosk_model_path = workspace_vosk_path
+            elif os.path.exists(f"{network_vosk_path}/am/final.mdl"):
                 vosk_model_path = network_vosk_path
             elif os.path.exists(f"{local_vosk_path}/am/final.mdl"):
                 vosk_model_path = local_vosk_path
@@ -348,6 +366,75 @@ def s3_upload_file(local_path, key_prefix=S3_PREFIX):
         logger.error(f"Unexpected S3 upload error: {e}")
         return {"error": str(e)}
 
+def s3_upload_file_async(local_path, key_prefix=S3_PREFIX, callback=None):
+    """
+    Upload a file to S3 asynchronously using the thread pool.
+    
+    Args:
+        local_path (str): Path to the local file to upload
+        key_prefix (str): S3 key prefix
+        callback (callable): Optional callback function to call when upload completes
+    
+    Returns:
+        Future: Future object representing the upload operation
+    """
+    def upload_with_callback():
+        try:
+            result = s3_upload_file(local_path, key_prefix)
+            if callback:
+                callback(result, local_path)
+            return result
+        except Exception as e:
+            logger.error(f"Async S3 upload error for {local_path}: {e}")
+            error_result = {"error": str(e)}
+            if callback:
+                callback(error_result, local_path)
+            return error_result
+    
+    logger.info(f"Submitting async S3 upload for: {local_path}")
+    future = S3_UPLOAD_EXECUTOR.submit(upload_with_callback)
+    S3_UPLOAD_FUTURES.put(future)
+    return future
+
+def cleanup_completed_uploads():
+    """Clean up completed upload futures to prevent memory leaks"""
+    completed_futures = []
+    try:
+        # Check completed futures without blocking
+        while not S3_UPLOAD_FUTURES.empty():
+            try:
+                future = S3_UPLOAD_FUTURES.get_nowait()
+                if future.done():
+                    completed_futures.append(future)
+                else:
+                    # Put it back if not done
+                    S3_UPLOAD_FUTURES.put(future)
+                    break
+            except queue.Empty:
+                break
+    except Exception as e:
+        logger.warning(f"Error during upload cleanup: {e}")
+    
+    if completed_futures:
+        logger.info(f"Cleaned up {len(completed_futures)} completed upload futures")
+
+def get_s3_upload_status():
+    """Get status of S3 uploads"""
+    try:
+        pending_count = S3_UPLOAD_FUTURES.qsize()
+        total_threads = S3_UPLOAD_EXECUTOR._threads
+        active_threads = len([t for t in total_threads if t.is_alive()]) if total_threads else 0
+        
+        return {
+            "pending_uploads": pending_count,
+            "active_threads": active_threads,
+            "max_workers": S3_UPLOAD_EXECUTOR._max_workers,
+            "executor_shutdown": S3_UPLOAD_EXECUTOR._shutdown
+        }
+    except Exception as e:
+        logger.warning(f"Error getting S3 upload status: {e}")
+        return {"error": str(e)}
+
 def transcribe_whisper(audio_file, sample_rate=24000):
     logger.info(f"Whisper transcription started for file: {audio_file}")
     start_time = datetime.now()
@@ -489,7 +576,7 @@ def transcribe_vosk_filepath(file_path, sample_rate=24000):
     # Use the existing transcribe_vosk function
     return transcribe_vosk(file_path, sample_rate)
 
-def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None):
+def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None, skip_conversion=None):
     logger.info(f"Chatterbox TTS started for text: '{text[:100]}{'...' if len(text) > 100 else ''}'")
     start_time = datetime.now()
     
@@ -543,83 +630,108 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
         else:
             wav = chatterbox_model.generate(text, **generation_params)
         
-        # Try direct encoding first (faster), fallback to FFmpeg if needed
-        logger.info("Converting audio to standard format (mono, 24kHz, 16-bit)...")
+        # Use skip_conversion parameter, defaulting to environment variable
+        if skip_conversion is None:
+            skip_conversion = SKIP_AUDIO_CONVERSION
         
-        try:
-            # Method 1: Direct PyTorch conversion (faster)
-            logger.info("Attempting direct PyTorch conversion...")
-            
-            # Convert to mono if stereo
-            if wav.shape[0] > 1:
-                wav = torch.mean(wav, dim=0, keepdim=True)
-                logger.info("Converted stereo to mono")
-            
-            # Resample to 24kHz if needed
-            original_sr = chatterbox_model.sr
-            target_sr = 24000
-            if original_sr != target_sr:
-                logger.info(f"Resampling from {original_sr}Hz to {target_sr}Hz")
-                resampler = torchaudio.transforms.Resample(orig_freq=original_sr, new_freq=target_sr)
-                wav = resampler(wav)
-            
-            # Save directly with target format
-            logger.info(f"Saving audio directly to: {output_path}")
-            torchaudio.save(output_path, wav, target_sr, bits_per_sample=16)
-            
-            # Verify the file was created successfully
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:  # At least 1KB
-                logger.info("✓ Direct PyTorch conversion successful")
-                conversion_method = "PyTorch (direct)"
-            else:
-                raise RuntimeError("Direct conversion produced invalid file")
+        conversion_method = "None (skipped)"
+        
+        if skip_conversion:
+            logger.info("Skipping audio conversion (using original format)...")
+            # Save directly with original format (faster)
+            try:
+                logger.info(f"Saving audio directly to: {output_path} (original format)")
+                torchaudio.save(output_path, wav, chatterbox_model.sr)
                 
-        except Exception as e:
-            logger.warning(f"Direct conversion failed: {e}, falling back to FFmpeg...")
-            conversion_method = "FFmpeg (fallback)"
-            
-            # Method 2: FFmpeg fallback (more reliable)
-            logger.info("Saving to temporary file for FFmpeg conversion...")
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                temp_path = temp_file.name
-                # Save with original sample rate first
-                torchaudio.save(temp_path, wav, chatterbox_model.sr)
-            
-            logger.info(f"Converting with FFmpeg...")
-            
-            # Use FFmpeg to convert to desired format
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",  # -y to overwrite output file
-                "-i", temp_path,  # input file
-                "-ac", "1",       # mono (1 channel)
-                "-ar", "24000",   # 24kHz sample rate
-                "-sample_fmt", "s16",  # 16-bit signed integer
-                "-f", "wav",      # WAV format
-                output_path       # output file
-            ]
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                    logger.info("✓ Direct save successful (no conversion)")
+                    conversion_method = "Direct (no conversion)"
+                else:
+                    raise RuntimeError("Direct save failed")
+            except Exception as e:
+                logger.error(f"Direct save failed: {e}")
+                # Fallback to conversion if direct save fails
+                skip_conversion = False
+                logger.info("Falling back to audio conversion...")
+        
+        if not skip_conversion:
+            # Try direct encoding first (faster), fallback to FFmpeg if needed
+            logger.info("Converting audio to standard format (mono, 24kHz, 16-bit)...")
             
             try:
-                logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
-                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
-                logger.info("✓ FFmpeg conversion completed successfully")
+                # Method 1: Direct PyTorch conversion (faster)
+                logger.info("Attempting direct PyTorch conversion...")
                 
-                # Clean up temporary file
-                os.unlink(temp_path)
-                logger.info("Temporary file cleaned up")
+                # Convert to mono if stereo
+                if wav.shape[0] > 1:
+                    wav = torch.mean(wav, dim=0, keepdim=True)
+                    logger.info("Converted stereo to mono")
                 
-            except subprocess.CalledProcessError as e:
-                logger.error(f"FFmpeg conversion failed: {e}")
-                logger.error(f"FFmpeg stderr: {e.stderr}")
+                # Resample to 24kHz if needed
+                original_sr = chatterbox_model.sr
+                target_sr = 24000
+                if original_sr != target_sr:
+                    logger.info(f"Resampling from {original_sr}Hz to {target_sr}Hz")
+                    resampler = torchaudio.transforms.Resample(orig_freq=original_sr, new_freq=target_sr)
+                    wav = resampler(wav)
                 
-                # Last resort: move temp file to final location
-                logger.info("Using original audio format (no conversion)")
-                os.rename(temp_path, output_path)
-                conversion_method = "Original (no conversion)"
+                # Save directly with target format
+                logger.info(f"Saving audio directly to: {output_path}")
+                torchaudio.save(output_path, wav, target_sr, bits_per_sample=16)
                 
-            except FileNotFoundError:
-                logger.error("FFmpeg not found! Using original audio format")
-                os.rename(temp_path, output_path)
-                conversion_method = "Original (FFmpeg not found)"
+                # Verify the file was created successfully
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:  # At least 1KB
+                    logger.info("✓ Direct PyTorch conversion successful")
+                    conversion_method = "PyTorch (direct)"
+                else:
+                    raise RuntimeError("Direct conversion produced invalid file")
+                    
+            except Exception as e:
+                logger.warning(f"Direct conversion failed: {e}, falling back to FFmpeg...")
+                conversion_method = "FFmpeg (fallback)"
+                
+                # Method 2: FFmpeg fallback (more reliable)
+                logger.info("Saving to temporary file for FFmpeg conversion...")
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                    temp_path = temp_file.name
+                    # Save with original sample rate first
+                    torchaudio.save(temp_path, wav, chatterbox_model.sr)
+                
+                logger.info(f"Converting with FFmpeg...")
+                
+                # Use FFmpeg to convert to desired format
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y",  # -y to overwrite output file
+                    "-i", temp_path,  # input file
+                    "-ac", "1",       # mono (1 channel)
+                    "-ar", "24000",   # 24kHz sample rate
+                    "-sample_fmt", "s16",  # 16-bit signed integer
+                    "-f", "wav",      # WAV format
+                    output_path       # output file
+                ]
+                
+                try:
+                    logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+                    logger.info("✓ FFmpeg conversion completed successfully")
+                    
+                    # Clean up temporary file
+                    os.unlink(temp_path)
+                    logger.info("Temporary file cleaned up")
+                    
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"FFmpeg conversion failed: {e}")
+                    logger.error(f"FFmpeg stderr: {e.stderr}")
+                    
+                    # Last resort: move temp file to final location
+                    logger.info("Using original audio format (no conversion)")
+                    os.rename(temp_path, output_path)
+                    conversion_method = "Original (no conversion)"
+                    
+                except FileNotFoundError:
+                    logger.error("FFmpeg not found! Using original audio format")
+                    os.rename(temp_path, output_path)
+                    conversion_method = "Original (FFmpeg not found)"
         
         logger.info(f"Audio saved as: {output_path} (method: {conversion_method})")
         
@@ -647,10 +759,33 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
             except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
                 logger.info("Could not verify audio format with ffprobe")
             
-            # Upload to S3 if configured
-            s3_info = s3_upload_file(output_path)
-            if s3_info:
-                logger.info(f"S3 upload info: {s3_info}")
+            # Upload to S3 asynchronously if configured
+            s3_future = None
+            s3_info = None
+            
+            def s3_upload_callback(result, file_path):
+                """Callback function for async S3 upload completion"""
+                if "error" in result:
+                    logger.error(f"Async S3 upload failed for {file_path}: {result['error']}")
+                else:
+                    logger.info(f"Async S3 upload completed for {file_path}: {result}")
+            
+            if S3_BUCKET:
+                logger.info("Starting async S3 upload...")
+                s3_future = s3_upload_file_async(output_path, callback=s3_upload_callback)
+                s3_info = {"status": "uploading", "future_id": id(s3_future)}
+                
+                # Clean up any completed uploads to prevent memory leaks
+                cleanup_completed_uploads()
+            else:
+                logger.info("S3_BUCKET not configured; skipping S3 upload")
+                s3_info = {"status": "skipped", "reason": "S3_BUCKET not configured"}
+            # Determine audio format description based on conversion
+            if skip_conversion:
+                audio_format_desc = f"Original format (sample rate: {chatterbox_model.sr}Hz)"
+            else:
+                audio_format_desc = "mono WAV, 24kHz, 16-bit"
+            
             # Return detailed result for API
             result = {
                 "audio_file": output_path,
@@ -658,14 +793,16 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
                 "filename": final_output_filename,
                 "file_size_mb": round(output_size, 2),
                 "generation_time_seconds": round(duration, 2),
-                "audio_format": "mono WAV, 24kHz, 16-bit",
+                "audio_format": audio_format_desc,
                 "conversion_method": conversion_method,
+                "skip_conversion": skip_conversion,
                 "parameters": {
                     "exaggeration": exaggeration,
                     "cfg_weight": cfg_weight,
                     "temperature": temperature,
                     "random_seed": random_seed,
-                    "custom_filename": output_filename
+                    "custom_filename": output_filename,
+                    "skip_conversion": skip_conversion
                 },
                 "text_length": len(text),
                 "used_audio_prompt": bool(audio_prompt and os.path.exists(audio_prompt)),
@@ -685,9 +822,9 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
         logger.error(traceback.format_exc())
         return {"error": error_msg}
 
-def chatterbox_clone_gradio(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None):
+def chatterbox_clone_gradio(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None, skip_conversion=None):
     """Wrapper function for Gradio interface that returns just the audio file path"""
-    result = chatterbox_clone(text, audio_prompt, exaggeration, cfg_weight, temperature, random_seed, output_filename)
+    result = chatterbox_clone(text, audio_prompt, exaggeration, cfg_weight, temperature, random_seed, output_filename, skip_conversion)
     
     if isinstance(result, dict):
         if "error" in result:
@@ -794,6 +931,15 @@ if __name__ == "__main__":
         # Add signal handlers for graceful shutdown
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, shutting down gracefully...")
+            
+            # Shutdown S3 upload executor
+            logger.info("Shutting down S3 upload executor...")
+            try:
+                S3_UPLOAD_EXECUTOR.shutdown(wait=True, timeout=30)
+                logger.info("✓ S3 upload executor shutdown completed")
+            except Exception as e:
+                logger.warning(f"Error shutting down S3 upload executor: {e}")
+            
             perform_pod_shutdown(shutdown_reason=f"signal:{signum}", logger=logger)
             sys.exit(0)
         
@@ -817,12 +963,28 @@ if __name__ == "__main__":
         
         # Try to clean up resources
         try:
+            # Shutdown S3 upload executor
+            logger.info("Shutting down S3 upload executor...")
+            try:
+                S3_UPLOAD_EXECUTOR.shutdown(wait=True, timeout=30)
+                logger.info("✓ S3 upload executor shutdown completed")
+            except Exception as e:
+                logger.warning(f"Error shutting down S3 upload executor: {e}")
+            
             perform_pod_shutdown(shutdown_reason="startup_exception", logger=logger)
         except:
             pass
             
         sys.exit(1)
     finally:
+        # Shutdown S3 upload executor
+        logger.info("Shutting down S3 upload executor...")
+        try:
+            S3_UPLOAD_EXECUTOR.shutdown(wait=True, timeout=30)
+            logger.info("✓ S3 upload executor shutdown completed")
+        except Exception as e:
+            logger.warning(f"Error shutting down S3 upload executor: {e}")
+        
         # Upload logs to S3 on shutdown
         try:
             perform_pod_shutdown(shutdown_reason="finally", logger=logger)
