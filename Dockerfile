@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir \
     gradio \
     numpy==1.26.4 \
     librosa \
-    chatterbox-tts \
+    git+https://github.com/rsxdalv/chatterbox.git@faster \
     peft \
     psutil \
     boto3 \
