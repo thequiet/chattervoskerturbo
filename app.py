@@ -55,7 +55,18 @@ logger.info("="*50)
 
 # Configuration settings
 SKIP_AUDIO_CONVERSION = os.environ.get("SKIP_AUDIO_CONVERSION", "true").lower() in ("true", "1", "yes")
+AUDIO_NORMALIZATION_ENABLED = os.environ.get("AUDIO_NORMALIZATION_ENABLED", "true").lower() in ("true", "1", "yes")
+AUDIO_TARGET_LUFS = float(os.environ.get("AUDIO_TARGET_LUFS", "-23.0"))
+AUDIO_MAX_PEAK_DB = float(os.environ.get("AUDIO_MAX_PEAK_DB", "-1.0"))
+AUDIO_LIMITER_THRESHOLD_DB = float(os.environ.get("AUDIO_LIMITER_THRESHOLD_DB", "-3.0"))
+AUDIO_LIMITER_RATIO = float(os.environ.get("AUDIO_LIMITER_RATIO", "8.0"))
+
 logger.info(f"Skip audio conversion: {SKIP_AUDIO_CONVERSION}")
+logger.info(f"Audio normalization enabled: {AUDIO_NORMALIZATION_ENABLED}")
+logger.info(f"Audio target LUFS: {AUDIO_TARGET_LUFS}")
+logger.info(f"Audio max peak: {AUDIO_MAX_PEAK_DB} dB")
+logger.info(f"Audio limiter threshold: {AUDIO_LIMITER_THRESHOLD_DB} dB")
+logger.info(f"Audio limiter ratio: {AUDIO_LIMITER_RATIO}:1")
 
 # Initialize S3 upload thread pool
 S3_UPLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=5, thread_name_prefix="s3-upload")
@@ -173,6 +184,106 @@ if torch.cuda.is_available():
     logger.info(f"GPU Memory after loading models: {torch.cuda.memory_allocated() / 1024**3:.1f}GB allocated")
 
 logger.info("All available models loaded successfully!")
+
+def normalize_audio(waveform, target_lufs=-23.0, max_peak_db=-1.0):
+    """
+    Normalize audio to prevent loud distortions and protect speakers.
+    
+    Args:
+        waveform (torch.Tensor): Input audio waveform
+        target_lufs (float): Target LUFS (Loudness Units relative to Full Scale)
+        max_peak_db (float): Maximum peak level in dB (should be negative)
+    
+    Returns:
+        torch.Tensor: Normalized audio waveform
+    """
+    logger.info("Applying audio normalization to prevent loud distortions...")
+    
+    # Ensure waveform is 2D (channels, samples)
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    
+    # Calculate current peak level
+    current_peak = torch.max(torch.abs(waveform))
+    current_peak_db = 20 * torch.log10(current_peak + 1e-8)  # Add small epsilon to avoid log(0)
+    
+    logger.info(f"Current peak level: {current_peak_db:.2f} dB")
+    
+    # Apply hard limiting first to prevent clipping
+    peak_limit_linear = 10 ** (max_peak_db / 20)
+    if current_peak > peak_limit_linear:
+        # Hard limit to prevent speaker damage
+        waveform = waveform / current_peak * peak_limit_linear
+        logger.info(f"Applied hard limiting to {max_peak_db} dB")
+    
+    # Apply RMS-based normalization for consistent loudness
+    rms = torch.sqrt(torch.mean(waveform ** 2))
+    rms_db = 20 * torch.log10(rms + 1e-8)
+    
+    # Calculate target RMS level (approximate LUFS to RMS conversion)
+    target_rms_db = target_lufs + 3.0  # Rough conversion from LUFS to RMS
+    
+    if rms_db > target_rms_db:
+        # Reduce level if too loud
+        gain_db = target_rms_db - rms_db
+        gain_linear = 10 ** (gain_db / 20)
+        waveform = waveform * gain_linear
+        logger.info(f"Applied gain reduction: {gain_db:.2f} dB (RMS: {rms_db:.2f} -> {target_rms_db:.2f} dB)")
+    
+    # Final safety check - ensure we never exceed the peak limit
+    final_peak = torch.max(torch.abs(waveform))
+    if final_peak > peak_limit_linear:
+        waveform = waveform / final_peak * peak_limit_linear
+        logger.info("Applied final safety limiting")
+    
+    final_peak_db = 20 * torch.log10(torch.max(torch.abs(waveform)) + 1e-8)
+    final_rms_db = 20 * torch.log10(torch.sqrt(torch.mean(waveform ** 2)) + 1e-8)
+    logger.info(f"Final levels - Peak: {final_peak_db:.2f} dB, RMS: {final_rms_db:.2f} dB")
+    
+    return waveform
+
+def apply_soft_limiting(waveform, threshold_db=-3.0, ratio=10.0):
+    """
+    Apply soft limiting/compression to prevent harsh clipping.
+    
+    Args:
+        waveform (torch.Tensor): Input audio waveform
+        threshold_db (float): Threshold in dB where limiting starts
+        ratio (float): Compression ratio (higher = more limiting)
+    
+    Returns:
+        torch.Tensor: Limited audio waveform
+    """
+    logger.info(f"Applying soft limiting with threshold: {threshold_db} dB, ratio: {ratio}:1")
+    
+    # Ensure waveform is 2D
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    
+    threshold_linear = 10 ** (threshold_db / 20)
+    
+    # Get the absolute values and signs
+    abs_waveform = torch.abs(waveform)
+    sign_waveform = torch.sign(waveform)
+    
+    # Apply soft limiting where signal exceeds threshold
+    mask = abs_waveform > threshold_linear
+    
+    if torch.any(mask):
+        # Calculate compressed levels for samples above threshold
+        excess_db = 20 * torch.log10(abs_waveform[mask] / threshold_linear + 1e-8)
+        compressed_excess_db = excess_db / ratio
+        compressed_linear = threshold_linear * (10 ** (compressed_excess_db / 20))
+        
+        # Replace values above threshold with compressed versions
+        abs_waveform[mask] = compressed_linear
+        
+        # Restore original signs
+        waveform = sign_waveform * abs_waveform
+        
+        logger.info(f"Applied soft limiting to {torch.sum(mask).item()} samples")
+    
+    return waveform
 
 def convert_audio_to_wav(input_path, sample_rate=24000, output_dir="/app/audio/converted"):
     """
@@ -629,6 +740,14 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
             wav = chatterbox_model.generate(text, audio_prompt_path=audio_prompt, **generation_params)
         else:
             wav = chatterbox_model.generate(text, **generation_params)
+        
+        # Apply audio normalization to prevent loud distortions and protect speakers
+        if AUDIO_NORMALIZATION_ENABLED:
+            logger.info("Applying audio normalization and safety limiting...")
+            wav = apply_soft_limiting(wav, threshold_db=AUDIO_LIMITER_THRESHOLD_DB, ratio=AUDIO_LIMITER_RATIO)  # Soft limiting first
+            wav = normalize_audio(wav, target_lufs=AUDIO_TARGET_LUFS, max_peak_db=AUDIO_MAX_PEAK_DB)  # Then normalize
+        else:
+            logger.info("Audio normalization disabled by configuration")
         
         # Use skip_conversion parameter, defaulting to environment variable
         if skip_conversion is None:
