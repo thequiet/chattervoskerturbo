@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir \
     gradio \
     numpy==1.26.4 \
     librosa \
-    git+https://github.com/rsxdalv/chatterbox.git@faster \
+    git+https://github.com/thequiet/chatterbox.git@faster \
     peft \
     psutil \
     boto3 \
