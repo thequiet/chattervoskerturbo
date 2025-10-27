@@ -10,12 +10,13 @@ exec > >(tee -a /tmp/model_download.log) 2>&1
 echo "Starting model download process... (PID: $$ at $(date))"
 
 # Configuration
-NETWORK_STORAGE="${RUNPOD_MOUNT_PATH:-/network-storage}"
+NETWORK_STORAGE="/network-storage"
 LOCAL_MODELS_DIR="/app/models"
 NETWORK_MODELS_DIR="${NETWORK_STORAGE}/models"
-WORKSPACE_MODELS_DIR="/workspace/models"
+#VOSK_MODEL_IDENTIFIER="vosk-model-en-us-0.22" # FULL
 VOSK_MODEL_IDENTIFIER="vosk-model-en-us-0.22-lgraph"
 VOSK_MODEL_NAME="vosk-model-en-us-0.22"
+
 WHISPER_CACHE_DIR="${NETWORK_STORAGE}/whisper-cache"
 CHATTERBOX_CACHE_DIR="${NETWORK_STORAGE}/chatterbox-cache"
 LOCAL_WHISPER_CACHE="/root/.cache/whisper"
@@ -28,44 +29,6 @@ REQUIRED_SPACE=5000000000  # 5GB
 MAX_RETRIES=3
 RETRY_DELAY=30
 LOCK_FILE="/tmp/model_download.lock"
-
-# Function to check for existing models in multiple locations
-find_existing_vosk_model() {
-    local locations=(
-        "$WORKSPACE_MODELS_DIR"
-        "$NETWORK_MODELS_DIR" 
-        "$LOCAL_MODELS_DIR"
-    )
-    
-    echo "Checking for existing VOSK models in multiple locations..."
-    
-    for location in "${locations[@]}"; do
-        local model_path="${location}/${VOSK_MODEL_NAME}"
-        echo "Checking: $model_path"
-        
-        if [ -d "$model_path" ] && [ -f "$model_path/am/final.mdl" ]; then
-            echo "✓ Found complete VOSK model at: $model_path"
-            
-            # Verify the model is accessible and has reasonable size
-            local model_size=$(du -s "$model_path" 2>/dev/null | cut -f1 || echo 0)
-            if [ "$model_size" -gt 1000000 ]; then  # > 1GB in KB
-                echo "✓ Model appears to be complete (${model_size}KB)"
-                
-                # Set MODELS_DIR to this location so symlinks work correctly
-                MODELS_DIR="$location"
-                echo "Using existing model directory: $MODELS_DIR"
-                return 0
-            else
-                echo "⚠ Model found but appears incomplete (${model_size}KB)"
-            fi
-        else
-            echo "No complete model found at $location"
-        fi
-    done
-    
-    echo "No existing complete VOSK model found in any location"
-    return 1
-}
 
 # Function to check available disk space
 check_disk_space() {
@@ -326,7 +289,6 @@ echo "=================================================="
 echo "Model Download Script Starting"
 echo "Network Storage: $NETWORK_STORAGE"
 echo "Local Models: $LOCAL_MODELS_DIR"
-echo "Workspace Models: $WORKSPACE_MODELS_DIR"
 echo "=================================================="
 
 # Check for existing lock file and wait if necessary
@@ -364,17 +326,14 @@ fi
 # Determine storage strategy
 determine_storage_strategy
 
-# Check if VOSK model already exists in any location (before acquiring lock)
-if find_existing_vosk_model; then
-    echo "✓ Using existing VOSK model - no download needed"
+# Check if VOSK model already exists (before acquiring lock)
+VOSK_MODEL_PATH="${MODELS_DIR}/${VOSK_MODEL_NAME}"
+if [ -d "$VOSK_MODEL_PATH" ] && [ -f "$VOSK_MODEL_PATH/am/final.mdl" ]; then
+    echo "✓ VOSK model already exists and appears complete at $VOSK_MODEL_PATH"
     setup_model_symlinks
     echo "✓ Model setup completed successfully"
     exit 0
 fi
-
-# If no existing model found, proceed with the determined storage strategy
-VOSK_MODEL_PATH="${MODELS_DIR}/${VOSK_MODEL_NAME}"
-echo "No existing model found, will download to: $VOSK_MODEL_PATH"
 
 # Acquire lock for download
 echo "Model not found or incomplete - attempting to acquire lock for download..."
