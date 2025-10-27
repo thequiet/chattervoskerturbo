@@ -114,21 +114,28 @@ except Exception as e:
 # Load VOSK model with error handling and network storage support
 vosk_model = None
 network_storage_path = os.environ.get("RUNPOD_MOUNT_PATH", "/network-storage")
-network_vosk_path = f"{network_storage_path}/models/vosk-model-en-us-0.22"
-local_vosk_path = "/app/models/vosk-model-en-us-0.22"
-workspace_vosk_path = "/workspace/models/vosk-model-en-us-0.22"
+VOSK_MODEL_DIR_CANDIDATES = [
+    "vosk-model-en-us-0.22-lgraph",
+    "vosk-model-en-us-0.22",
+]
+VOSK_SEARCH_LOCATIONS = [
+    ("workspace", "/workspace/models"),
+    ("network storage", f"{network_storage_path}/models"),
+    ("local storage", "/app/models"),
+]
 
-# Determine which VOSK model path to use (check in priority order)
-vosk_model_path = None
-if os.path.exists(workspace_vosk_path) and os.path.exists(f"{workspace_vosk_path}/am/final.mdl"):
-    vosk_model_path = workspace_vosk_path
-    logger.info(f"Using VOSK model from workspace: {vosk_model_path}")
-elif os.path.exists(network_vosk_path) and os.path.exists(f"{network_vosk_path}/am/final.mdl"):
-    vosk_model_path = network_vosk_path
-    logger.info(f"Using VOSK model from network storage: {vosk_model_path}")
-elif os.path.exists(local_vosk_path) and os.path.exists(f"{local_vosk_path}/am/final.mdl"):
-    vosk_model_path = local_vosk_path
-    logger.info(f"Using VOSK model from local storage: {vosk_model_path}")
+
+def resolve_vosk_model_path():
+    for location_name, root_dir in VOSK_SEARCH_LOCATIONS:
+        for model_dir in VOSK_MODEL_DIR_CANDIDATES:
+            candidate_path = os.path.join(root_dir, model_dir)
+            if os.path.exists(os.path.join(candidate_path, "am", "final.mdl")):
+                logger.info(f"Using VOSK model from {location_name}: {candidate_path}")
+                return candidate_path
+    return None
+
+
+vosk_model_path = resolve_vosk_model_path()
 
 if vosk_model_path:
     logger.info(f"Loading VOSK model from: {vosk_model_path}")
@@ -141,18 +148,21 @@ if vosk_model_path:
         logger.warning("VOSK transcription will be disabled.")
         vosk_model = None
 else:
-    logger.warning(f"VOSK model not found at {workspace_vosk_path}, {network_vosk_path}, or {local_vosk_path}. Attempting to download...")
+    searched_paths = [
+        os.path.join(root_dir, model_dir)
+        for _, root_dir in VOSK_SEARCH_LOCATIONS
+        for model_dir in VOSK_MODEL_DIR_CANDIDATES
+    ]
+    logger.warning(
+        "VOSK model not found. Searched paths: %s. Attempting to download...",
+        ", ".join(searched_paths)
+    )
     try:
         result = subprocess.run(["/app/download_models.sh"], capture_output=True, text=True)
         if result.returncode == 0:
             # Check again for model after download (check in priority order)
-            if os.path.exists(f"{workspace_vosk_path}/am/final.mdl"):
-                vosk_model_path = workspace_vosk_path
-            elif os.path.exists(f"{network_vosk_path}/am/final.mdl"):
-                vosk_model_path = network_vosk_path
-            elif os.path.exists(f"{local_vosk_path}/am/final.mdl"):
-                vosk_model_path = local_vosk_path
-            
+            vosk_model_path = resolve_vosk_model_path()
+
             if vosk_model_path:
                 logger.info(f"VOSK model downloaded successfully. Loading from {vosk_model_path}...")
                 vosk_model = Model(vosk_model_path)

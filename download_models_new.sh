@@ -15,7 +15,7 @@ LOCAL_MODELS_DIR="/app/models"
 NETWORK_MODELS_DIR="${NETWORK_STORAGE}/models"
 #VOSK_MODEL_IDENTIFIER="vosk-model-en-us-0.22" # FULL
 VOSK_MODEL_IDENTIFIER="vosk-model-en-us-0.22-lgraph"
-VOSK_MODEL_NAME="vosk-model-en-us-0.22"
+VOSK_MODEL_NAME="vosk-model-en-us-0.22-lgraph"
 
 WHISPER_CACHE_DIR="${NETWORK_STORAGE}/whisper-cache"
 CHATTERBOX_CACHE_DIR="${NETWORK_STORAGE}/chatterbox-cache"
@@ -25,8 +25,9 @@ LOCAL_CHATTERBOX_CACHE="/root/.cache/huggingface"
 # VOSK model configuration
 VOSK_MODEL_URL="https://alphacephei.com/vosk/models/${VOSK_MODEL_IDENTIFIER}.zip"
 # MIN_FILE_SIZE=1800000000  # ~1.8GB (LARGE)
-MIN_FILE_SIZE=120000000  # 120 MB (MEDIUM)
-REQUIRED_SPACE=5000000000  # 5GB
+MIN_FILE_SIZE=150000000  # 150 MB (LGRAPH)
+MIN_MODEL_DIR_SIZE=250000000  # 250 MB unpacked
+REQUIRED_SPACE=1000000000  # 1GB
 MAX_RETRIES=3
 RETRY_DELAY=30
 LOCK_FILE="/tmp/model_download.lock"
@@ -254,7 +255,7 @@ download_vosk_model() {
     
     # Verify model directory size
     local model_size=$(du -sb "$model_path" | cut -f1)
-    if [ "$model_size" -lt 1800000000 ]; then
+    if [ "$model_size" -lt "$MIN_MODEL_DIR_SIZE" ]; then
         echo "ERROR: Extracted model directory too small ($model_size bytes)"
         rm -rf "$model_path"
         return 1
