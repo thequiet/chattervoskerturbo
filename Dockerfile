@@ -27,7 +27,8 @@ RUN pip install --no-cache-dir \
 # Install PyTorch with CUDA support and Triton
 RUN pip install --no-cache-dir \
     torch torchaudio --index-url https://download.pytorch.org/whl/cu121 \
-    triton>=2.0.0
+    triton>=2.0.0 \
+    torchcodec
 
 # Set working directory
 WORKDIR /app
