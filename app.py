@@ -5,6 +5,7 @@ import json
 import wave
 import numpy as np
 import os
+import random
 import torch
 import torchaudio
 import soundfile as sf
@@ -220,6 +221,39 @@ def save_waveform_with_soundfile(path, waveform, sample_rate, subtype=None):
 
     write_kwargs = {"subtype": subtype} if subtype else {}
     sf.write(path, data, sample_rate, **write_kwargs)
+
+
+def apply_random_seed(seed_value):
+    """Apply deterministic seed across Python, NumPy, and PyTorch with graceful CUDA fallback."""
+    try:
+        seed_int = int(seed_value)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid random seed '{seed_value}' provided; skipping deterministic seeding.")
+        return None
+
+    if seed_int < 0:
+        logger.warning(f"Random seed {seed_int} is negative; converting to positive value.")
+        seed_int = abs(seed_int)
+
+    max_seed = 2 ** 63 - 1
+    if seed_int > max_seed:
+        logger.warning(f"Random seed {seed_int} exceeds {max_seed}; reducing modulo range.")
+        seed_int %= max_seed
+
+    random.seed(seed_int)
+    np.random.seed(seed_int)
+
+    try:
+        torch.manual_seed(seed_int)
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.manual_seed_all(seed_int)
+            except Exception as cuda_err:
+                logger.warning(f"Failed to seed CUDA RNG (continuing without GPU determinism): {cuda_err}")
+    except Exception as torch_err:
+        logger.warning(f"Failed to seed PyTorch RNG (continuing without determinism): {torch_err}")
+
+    return seed_int
 
 def normalize_audio(waveform, target_lufs=-23.0, max_peak_db=-1.0):
     """
@@ -768,8 +802,11 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
             "temperature": temperature
         }
         if random_seed is not None:
-            torch.manual_seed(random_seed)  # Set seed for reproducibility if provided
-            logger.info(f"Set random seed: {random_seed}")
+            applied_seed = apply_random_seed(random_seed)
+            if applied_seed is not None:
+                logger.info(f"Set random seed: {applied_seed}")
+            else:
+                logger.info("Random seed could not be applied; proceeding with non-deterministic RNG state.")
 
         logger.info("Generating audio...")
         if audio_prompt and os.path.exists(audio_prompt):
