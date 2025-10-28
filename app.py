@@ -7,6 +7,7 @@ import numpy as np
 import os
 import torch
 import torchaudio
+import soundfile as sf
 import logging
 import traceback
 import sys
@@ -195,6 +196,31 @@ if torch.cuda.is_available():
 
 logger.info("All available models loaded successfully!")
 
+def save_waveform_with_soundfile(path, waveform, sample_rate, subtype=None):
+    """Save a waveform tensor to disk using soundfile.
+
+    Args:
+        path (str): Destination file path.
+        waveform (torch.Tensor): Audio tensor shaped (channels, samples) or (samples,).
+        sample_rate (int): Sample rate for the audio file.
+        subtype (str | None): Optional soundfile subtype (e.g., 'PCM_16', 'FLOAT').
+    """
+    # Ensure tensor is detached on CPU
+    if isinstance(waveform, torch.Tensor):
+        waveform = waveform.detach().cpu()
+
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    # Clamp to valid audio range just in case processing introduced overs
+    waveform = torch.clamp(waveform, -1.0, 1.0)
+
+    # Convert to (samples, channels) layout for soundfile
+    data = waveform.transpose(0, 1).numpy()
+
+    write_kwargs = {"subtype": subtype} if subtype else {}
+    sf.write(path, data, sample_rate, **write_kwargs)
+
 def normalize_audio(waveform, target_lufs=-23.0, max_peak_db=-1.0):
     """
     Normalize audio to prevent loud distortions and protect speakers.
@@ -350,7 +376,7 @@ def convert_audio_to_wav(input_path, sample_rate=24000, output_dir="/app/audio/c
             
             # Save as 16-bit WAV
             logger.info(f"Saving converted audio to: {output_path}")
-            torchaudio.save(output_path, waveform, sample_rate, bits_per_sample=16)
+            save_waveform_with_soundfile(output_path, waveform, sample_rate, subtype="PCM_16")
             
             # Verify the conversion
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:  # At least 1KB
@@ -770,7 +796,7 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
             # Save directly with original format (faster)
             try:
                 logger.info(f"Saving audio directly to: {output_path} (original format)")
-                torchaudio.save(output_path, wav, chatterbox_model.sr)
+                save_waveform_with_soundfile(output_path, wav, chatterbox_model.sr, subtype="FLOAT")
                 
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
                     logger.info("✓ Direct save successful (no conversion)")
@@ -806,7 +832,7 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
                 
                 # Save directly with target format
                 logger.info(f"Saving audio directly to: {output_path}")
-                torchaudio.save(output_path, wav, target_sr, bits_per_sample=16)
+                save_waveform_with_soundfile(output_path, wav, target_sr, subtype="PCM_16")
                 
                 # Verify the file was created successfully
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:  # At least 1KB
@@ -823,8 +849,8 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
                 logger.info("Saving to temporary file for FFmpeg conversion...")
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
                     temp_path = temp_file.name
-                    # Save with original sample rate first
-                    torchaudio.save(temp_path, wav, chatterbox_model.sr)
+                # Close file before writing with soundfile
+                save_waveform_with_soundfile(temp_path, wav, chatterbox_model.sr, subtype="PCM_16")
                 
                 logger.info(f"Converting with FFmpeg...")
                 

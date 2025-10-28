@@ -3,6 +3,7 @@ FROM python:3.11-slim
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    libsndfile1 \
     git \
     curl \
     unzip \
@@ -17,6 +18,7 @@ RUN pip install --no-cache-dir \
     gradio \
     numpy==1.26.4 \
     librosa \
+    soundfile \
     git+https://github.com/thequiet/chatterbox.git@faster \
     peft \
     psutil \
@@ -27,8 +29,7 @@ RUN pip install --no-cache-dir \
 # Install PyTorch with CUDA support and Triton
 RUN pip install --no-cache-dir \
     torch torchaudio --index-url https://download.pytorch.org/whl/cu121 \
-    triton>=2.0.0 \
-    torchcodec
+    triton>=2.0.0
 
 # Set working directory
 WORKDIR /app
