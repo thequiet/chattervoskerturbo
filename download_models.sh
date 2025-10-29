@@ -41,27 +41,37 @@ find_existing_vosk_model() {
     echo "Checking for existing VOSK models in multiple locations..."
     
     for location in "${locations[@]}"; do
-        local model_path="${location}/${VOSK_MODEL_NAME}"
-        echo "Checking: $model_path"
-        
-        if [ -d "$model_path" ] && [ -f "$model_path/am/final.mdl" ]; then
-            echo "✓ Found complete VOSK model at: $model_path"
+        # Check for both the expected name and the identifier name
+        for model_dir_name in "$VOSK_MODEL_NAME" "$VOSK_MODEL_IDENTIFIER"; do
+            local model_path="${location}/${model_dir_name}"
+            echo "Checking: $model_path"
             
-            # Verify the model is accessible and has reasonable size
-            local model_size=$(du -s "$model_path" 2>/dev/null | cut -f1 || echo 0)
-            if [ "$model_size" -gt 1000000 ]; then  # > 1GB in KB
-                echo "✓ Model appears to be complete (${model_size}KB)"
+            if [ -d "$model_path" ] && [ -f "$model_path/am/final.mdl" ]; then
+                echo "✓ Found complete VOSK model at: $model_path"
                 
-                # Set MODELS_DIR to this location so symlinks work correctly
-                MODELS_DIR="$location"
-                echo "Using existing model directory: $MODELS_DIR"
-                return 0
-            else
-                echo "⚠ Model found but appears incomplete (${model_size}KB)"
+                # Verify the model is accessible and has reasonable size
+                local model_size=$(du -s "$model_path" 2>/dev/null | cut -f1 || echo 0)
+                if [ "$model_size" -gt 100000 ]; then  # > 100MB in KB
+                    echo "✓ Model appears to be complete (${model_size}KB)"
+                    
+                    # If found with identifier name, rename it to the expected name
+                    if [ "$model_dir_name" = "$VOSK_MODEL_IDENTIFIER" ] && [ "$VOSK_MODEL_IDENTIFIER" != "$VOSK_MODEL_NAME" ]; then
+                        local expected_path="${location}/${VOSK_MODEL_NAME}"
+                        echo "Renaming model from ${VOSK_MODEL_IDENTIFIER} to ${VOSK_MODEL_NAME}..."
+                        mv "$model_path" "$expected_path" || true
+                        model_path="$expected_path"
+                    fi
+                    
+                    # Set MODELS_DIR to this location so symlinks work correctly
+                    MODELS_DIR="$location"
+                    echo "Using existing model directory: $MODELS_DIR"
+                    return 0
+                else
+                    echo "⚠ Model found but appears incomplete (${model_size}KB)"
+                fi
             fi
-        else
-            echo "No complete model found at $location"
-        fi
+        done
+        echo "No complete model found at $location"
     done
     
     echo "No existing complete VOSK model found in any location"
@@ -274,9 +284,10 @@ download_vosk_model() {
         return 1
     fi
     
-    # Remove existing model directory to avoid overwrite prompts
-    echo "Removing any existing model directory..."
+    # Remove existing model directories to avoid overwrite prompts
+    echo "Removing any existing model directories..."
     rm -rf "$model_path"
+    rm -rf "${target_dir}/${VOSK_MODEL_IDENTIFIER}"
     
     echo "Extracting VOSK model..."
     if ! unzip -q -o "$zip_file" -d "$target_dir"; then
@@ -285,11 +296,22 @@ download_vosk_model() {
         return 1
     fi
     
+    # The zip extracts to VOSK_MODEL_IDENTIFIER, but we need it as VOSK_MODEL_NAME
+    local extracted_path="${target_dir}/${VOSK_MODEL_IDENTIFIER}"
+    if [ -d "$extracted_path" ] && [ "$extracted_path" != "$model_path" ]; then
+        echo "Renaming extracted directory from ${VOSK_MODEL_IDENTIFIER} to ${VOSK_MODEL_NAME}..."
+        mv "$extracted_path" "$model_path"
+    fi
+    
     # Verify the extraction was successful
     if [ ! -f "$model_path/am/final.mdl" ]; then
         echo "ERROR: Model extraction appears incomplete - key files not found"
+        echo "Looking for: $model_path/am/final.mdl"
+        echo "Directory contents:"
+        ls -la "$target_dir" || true
         rm -f "$zip_file"
         rm -rf "$model_path"
+        rm -rf "$extracted_path"
         return 1
     fi
     
