@@ -274,8 +274,12 @@ download_vosk_model() {
         return 1
     fi
     
+    # Remove existing model directory to avoid overwrite prompts
+    echo "Removing any existing model directory..."
+    rm -rf "$model_path"
+    
     echo "Extracting VOSK model..."
-    if ! unzip -q "$zip_file" -d "$target_dir"; then
+    if ! unzip -q -o "$zip_file" -d "$target_dir"; then
         echo "ERROR: Failed to extract VOSK model"
         rm -f "$zip_file"
         return 1
@@ -289,16 +293,16 @@ download_vosk_model() {
         return 1
     fi
     
-    # Verify model directory size
+    # Verify model directory size (using MIN_FILE_SIZE as a baseline)
     local model_size=$(du -sb "$model_path" | cut -f1)
-    if [ "$model_size" -lt 1800000000 ]; then
+    if [ "$model_size" -lt "$MIN_FILE_SIZE" ]; then
         echo "ERROR: Extracted model directory too small ($model_size bytes)"
         rm -rf "$model_path"
         return 1
     fi
     
     rm -f "$zip_file"
-    echo "✓ VOSK model downloaded and extracted successfully to $model_path"
+    echo "✓ VOSK model downloaded and extracted successfully to $model_path (size: $model_size bytes)"
     return 0
 }
 
