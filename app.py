@@ -1,10 +1,20 @@
+import os
+
+# Optional CUDA debug controls (set via *_OVERRIDE env vars to avoid clobbering container defaults)
+cuda_launch_blocking_override = os.environ.get("CUDA_LAUNCH_BLOCKING_OVERRIDE")
+if cuda_launch_blocking_override is not None:
+    os.environ["CUDA_LAUNCH_BLOCKING"] = cuda_launch_blocking_override
+
+torch_use_cuda_dsa_override = os.environ.get("TORCH_USE_CUDA_DSA_OVERRIDE")
+if torch_use_cuda_dsa_override is not None:
+    os.environ["TORCH_USE_CUDA_DSA"] = torch_use_cuda_dsa_override
+
 import gradio as gr
 import whisper
 from vosk import Model, KaldiRecognizer
 import json
 import wave
 import numpy as np
-import os
 import random
 import torch
 import torchaudio
@@ -15,6 +25,7 @@ import sys
 import subprocess
 import tempfile
 import signal
+import uuid
 from datetime import datetime
 from chatterbox.tts import ChatterboxTTS
 import boto3
@@ -34,6 +45,12 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+if cuda_launch_blocking_override is not None:
+    logger.info(f"CUDA_LAUNCH_BLOCKING override applied: {cuda_launch_blocking_override}")
+
+if torch_use_cuda_dsa_override is not None:
+    logger.info(f"TORCH_USE_CUDA_DSA override applied: {torch_use_cuda_dsa_override}")
 
 # Set up specific loggers for different components
 gradio_logger = logging.getLogger('gradio')
@@ -62,6 +79,9 @@ AUDIO_TARGET_LUFS = float(os.environ.get("AUDIO_TARGET_LUFS", "-23.0"))
 AUDIO_MAX_PEAK_DB = float(os.environ.get("AUDIO_MAX_PEAK_DB", "-1.0"))
 AUDIO_LIMITER_THRESHOLD_DB = float(os.environ.get("AUDIO_LIMITER_THRESHOLD_DB", "-3.0"))
 AUDIO_LIMITER_RATIO = float(os.environ.get("AUDIO_LIMITER_RATIO", "8.0"))
+PROMPT_TARGET_SAMPLE_RATE = 24000
+PROMPT_EXPECTED_CHANNELS = 1
+PROMPT_SANITIZED_DIR = "/tmp/chatterbox_prompts"
 
 logger.info(f"Skip audio conversion: {SKIP_AUDIO_CONVERSION}")
 logger.info(f"Audio normalization enabled: {AUDIO_NORMALIZATION_ENABLED}")
@@ -106,12 +126,37 @@ try:
     logger.info("Loading Whisper model...")
     # Whisper will use cache directory from environment or default ~/.cache/whisper
     # The download_models.sh script sets up symlinks for cache redirection
-    whisper_model = whisper.load_model("turbo", device=device)
-    logger.info("✓ Whisper model loaded successfully")
+    
+    # Set download root to prevent network access if model is already cached
+    whisper_cache_dir = os.environ.get("WHISPER_CACHE_DIR", os.path.expanduser("~/.cache/whisper"))
+    logger.info(f"Whisper cache directory: {whisper_cache_dir}")
+    
+    # Try to load with cache, fallback to download if needed
+    try:
+        whisper_model = whisper.load_model("turbo", device=device, download_root=whisper_cache_dir)
+        logger.info("✓ Whisper model loaded successfully")
+    except Exception as download_error:
+        logger.warning(f"Failed to download Whisper model (network issue): {download_error}")
+        logger.info("Attempting to load from existing cache...")
+        
+        # Try to find cached model
+        model_name = "turbo"
+        expected_cache_file = os.path.join(whisper_cache_dir, f"{model_name}.pt")
+        
+        if os.path.exists(expected_cache_file):
+            logger.info(f"Found cached model at: {expected_cache_file}")
+            whisper_model = whisper.load_model("turbo", device=device, download_root=whisper_cache_dir)
+            logger.info("✓ Whisper model loaded from cache")
+        else:
+            logger.error(f"No cached Whisper model found at: {expected_cache_file}")
+            logger.error("Whisper functionality will be unavailable")
+            whisper_model = None
+            
 except Exception as e:
     logger.error(f"✗ Failed to load Whisper model: {e}")
     logger.error(traceback.format_exc())
-    raise
+    logger.error("Whisper functionality will be unavailable")
+    whisper_model = None
 
 # Load VOSK model with error handling and network storage support
 vosk_model = None
@@ -197,6 +242,9 @@ if torch.cuda.is_available():
 
 logger.info("All available models loaded successfully!")
 
+# Guard Chatterbox generations to prevent concurrent CUDA access, which can trigger device asserts
+CHATTERBOX_GENERATION_LOCK = threading.Lock()
+
 def save_waveform_with_soundfile(path, waveform, sample_rate, subtype=None):
     """Save a waveform tensor to disk using soundfile.
 
@@ -221,6 +269,81 @@ def save_waveform_with_soundfile(path, waveform, sample_rate, subtype=None):
 
     write_kwargs = {"subtype": subtype} if subtype else {}
     sf.write(path, data, sample_rate, **write_kwargs)
+
+
+def ensure_prompt_audio_format(audio_path, target_sr=PROMPT_TARGET_SAMPLE_RATE):
+    """Ensure audio prompt matches expected mono 24kHz PCM16 format.
+
+    Returns:
+        tuple[str, str | None]: (path to use, temp path to clean up if created)
+    """
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio prompt not found: {audio_path}")
+
+    try:
+        info = torchaudio.info(audio_path)
+        bits_per_sample = getattr(info, "bits_per_sample", None)
+        logger.info(
+            "Audio prompt metadata - path: %s, sample_rate: %s, channels: %s, bits_per_sample: %s",
+            audio_path,
+            getattr(info, "sample_rate", "unknown"),
+            getattr(info, "num_channels", "unknown"),
+            bits_per_sample,
+        )
+    except Exception as meta_err:
+        logger.warning(f"Failed to read audio metadata for {audio_path}: {meta_err}")
+        info = None
+        bits_per_sample = None
+
+    waveform, sample_rate = torchaudio.load(audio_path)
+    channels = waveform.shape[0]
+    min_val = waveform.min().item()
+    max_val = waveform.max().item()
+
+    logger.info(
+        "Audio prompt stats - sr: %d, channels: %d, min: %.4f, max: %.4f",
+        sample_rate,
+        channels,
+        min_val,
+        max_val,
+    )
+
+    needs_mono = channels != PROMPT_EXPECTED_CHANNELS
+    needs_resample = sample_rate != target_sr
+    exceeds_range = min_val < -1.0 or max_val > 1.0
+
+    # Clamp regardless to prevent any stray values
+    waveform = torch.clamp(waveform, -1.0, 1.0)
+
+    if needs_mono:
+        waveform = waveform.mean(dim=0, keepdim=True)
+        logger.info("Audio prompt converted to mono")
+
+    if needs_resample:
+        logger.info("Resampling audio prompt from %dHz to %dHz", sample_rate, target_sr)
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sr)
+        waveform = resampler(waveform)
+        sample_rate = target_sr
+
+    already_compliant = (
+        not needs_mono
+        and not needs_resample
+        and not exceeds_range
+        and info is not None
+        and getattr(info, "sample_rate", None) == target_sr
+        and getattr(info, "num_channels", None) == PROMPT_EXPECTED_CHANNELS
+        and bits_per_sample == 16
+    )
+
+    if already_compliant:
+        logger.info("Audio prompt already 24kHz mono PCM16; using original file")
+        return audio_path, None
+
+    os.makedirs(PROMPT_SANITIZED_DIR, exist_ok=True)
+    sanitized_path = os.path.join(PROMPT_SANITIZED_DIR, f"prompt_{uuid.uuid4().hex}.wav")
+    save_waveform_with_soundfile(sanitized_path, waveform, target_sr, subtype="PCM_16")
+    logger.info("Audio prompt sanitized and saved to %s", sanitized_path)
+    return sanitized_path, sanitized_path
 
 
 def apply_random_seed(seed_value):
@@ -621,6 +744,11 @@ def transcribe_whisper(audio_file, sample_rate=24000):
     start_time = datetime.now()
     
     try:
+        # Check if Whisper model is available
+        if whisper_model is None:
+            logger.error("Whisper model is not available (failed to load)")
+            return {"error": "Whisper model is not available. Please use VOSK transcription instead."}
+        
         # Log file info
         if audio_file and os.path.exists(audio_file):
             file_size = os.path.getsize(audio_file) / (1024 * 1024)  # MB
@@ -665,6 +793,11 @@ def transcribe_whisper(audio_file, sample_rate=24000):
 def transcribe_whisper_filepath(file_path, sample_rate=24000):
     """Whisper transcription function that accepts server-side file paths"""
     logger.info(f"Whisper filepath transcription started for: {file_path}")
+    
+    # Check if Whisper model is available
+    if whisper_model is None:
+        logger.error("Whisper model is not available (failed to load)")
+        return {"error": "Whisper model is not available. Please use VOSK transcription instead."}
     
     # Check if file exists on server
     if not os.path.exists(file_path):
@@ -801,18 +934,52 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
             "cfg_weight": cfg_weight,
             "temperature": temperature
         }
-        if random_seed is not None:
-            applied_seed = apply_random_seed(random_seed)
-            if applied_seed is not None:
-                logger.info(f"Set random seed: {applied_seed}")
-            else:
-                logger.info("Random seed could not be applied; proceeding with non-deterministic RNG state.")
 
-        logger.info("Generating audio...")
-        if audio_prompt and os.path.exists(audio_prompt):
-            wav = chatterbox_model.generate(text, audio_prompt_path=audio_prompt, **generation_params)
-        else:
-            wav = chatterbox_model.generate(text, **generation_params)
+        # Serialize GPU-bound chatterbox generation to avoid device-side asserts from concurrent kernels
+        lock_acquired = CHATTERBOX_GENERATION_LOCK.acquire(blocking=False)
+        if not lock_acquired:
+            logger.info("Chatterbox GPU is busy; waiting for the current generation to finish...")
+            CHATTERBOX_GENERATION_LOCK.acquire()
+            lock_acquired = True
+
+        prompt_cleanup_path = None
+        try:
+            if random_seed is not None:
+                applied_seed = apply_random_seed(random_seed)
+                if applied_seed is not None:
+                    logger.info(f"Set random seed: {applied_seed}")
+                else:
+                    logger.info("Random seed could not be applied; proceeding with non-deterministic RNG state.")
+
+            logger.info("Generating audio...")
+
+            sanitized_prompt_path = None
+            if audio_prompt and os.path.exists(audio_prompt):
+                try:
+                    sanitized_prompt_path, prompt_cleanup_path = ensure_prompt_audio_format(audio_prompt)
+                    if prompt_cleanup_path:
+                        logger.info(f"Using sanitized audio prompt copy: {sanitized_prompt_path}")
+                    else:
+                        logger.info("Audio prompt passed validation without changes")
+                except Exception as prompt_err:
+                    logger.error(f"Audio prompt validation failed ({audio_prompt}): {prompt_err}")
+                    raise
+
+            if sanitized_prompt_path:
+                wav = chatterbox_model.generate(text, audio_prompt_path=sanitized_prompt_path, **generation_params)
+            else:
+                wav = chatterbox_model.generate(text, **generation_params)
+        finally:
+            if prompt_cleanup_path and prompt_cleanup_path != audio_prompt:
+                try:
+                    os.remove(prompt_cleanup_path)
+                    logger.info(f"Removed temporary sanitized prompt: {prompt_cleanup_path}")
+                except FileNotFoundError:
+                    pass
+                except Exception as cleanup_err:
+                    logger.warning(f"Failed to delete temporary prompt {prompt_cleanup_path}: {cleanup_err}")
+            if lock_acquired:
+                CHATTERBOX_GENERATION_LOCK.release()
         
         # Apply audio normalization to prevent loud distortions and protect speakers
         if AUDIO_NORMALIZATION_ENABLED:
