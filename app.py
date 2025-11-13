@@ -280,22 +280,78 @@ def ensure_prompt_audio_format(audio_path, target_sr=PROMPT_TARGET_SAMPLE_RATE):
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio prompt not found: {audio_path}")
 
-    try:
-        info = torchaudio.info(audio_path)
-        bits_per_sample = getattr(info, "bits_per_sample", None)
-        logger.info(
-            "Audio prompt metadata - path: %s, sample_rate: %s, channels: %s, bits_per_sample: %s",
-            audio_path,
-            getattr(info, "sample_rate", "unknown"),
-            getattr(info, "num_channels", "unknown"),
-            bits_per_sample,
-        )
-    except Exception as meta_err:
-        logger.warning(f"Failed to read audio metadata for {audio_path}: {meta_err}")
-        info = None
-        bits_per_sample = None
+    info = None
+    bits_per_sample = None
 
-    waveform, sample_rate = torchaudio.load(audio_path)
+    # Gather metadata using torchaudio (if available) or soundfile as fallback
+    try:
+        if hasattr(torchaudio, "info"):
+            info = torchaudio.info(audio_path)
+        elif hasattr(torchaudio.backend, "sox_io_backend") and hasattr(torchaudio.backend.sox_io_backend, "info"):
+            info = torchaudio.backend.sox_io_backend.info(audio_path)
+        if info is not None:
+            bits_per_sample = getattr(info, "bits_per_sample", None)
+            logger.info(
+                "Audio prompt metadata - path: %s, sample_rate: %s, channels: %s, bits_per_sample: %s",
+                audio_path,
+                getattr(info, "sample_rate", "unknown"),
+                getattr(info, "num_channels", "unknown"),
+                bits_per_sample,
+            )
+    except Exception as meta_err:
+        try:
+            sf_info = sf.info(audio_path)
+            info = sf_info
+            bits_per_sample = 16 if getattr(sf_info, "subtype", None) == "PCM_16" else getattr(sf_info, "subtype", None)
+            logger.info(
+                "Audio prompt metadata (soundfile) - path: %s, sample_rate: %s, channels: %s, subtype: %s",
+                audio_path,
+                getattr(sf_info, "samplerate", "unknown"),
+                getattr(sf_info, "channels", "unknown"),
+                getattr(sf_info, "subtype", "unknown"),
+            )
+        except Exception:
+            logger.warning(f"Failed to read audio metadata for {audio_path}: {meta_err}")
+            info = None
+            bits_per_sample = None
+
+    try:
+        waveform, sample_rate = torchaudio.load(audio_path)
+    except Exception as load_err:
+        logger.warning(f"torchaudio.load failed for {audio_path}: {load_err}. Falling back to soundfile.")
+        ffmpeg_decode_path = None
+        try:
+            data, sample_rate = sf.read(audio_path, always_2d=True)
+            waveform = torch.from_numpy(data.T).float()
+        except Exception as sf_err:
+            logger.warning(f"soundfile read failed for {audio_path}: {sf_err}. Attempting ffmpeg decode.")
+            try:
+                os.makedirs(PROMPT_SANITIZED_DIR, exist_ok=True)
+                ffmpeg_decode_path = os.path.join(PROMPT_SANITIZED_DIR, f"decode_{uuid.uuid4().hex}.wav")
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    audio_path,
+                    "-ac",
+                    str(PROMPT_EXPECTED_CHANNELS),
+                    "-ar",
+                    str(target_sr),
+                    "-sample_fmt",
+                    "s16",
+                    ffmpeg_decode_path,
+                ]
+                subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+                data, sample_rate = sf.read(ffmpeg_decode_path, always_2d=True)
+                waveform = torch.from_numpy(data.T).float()
+            except Exception as ffmpeg_err:
+                raise RuntimeError(f"Failed to decode audio prompt {audio_path}: {ffmpeg_err}") from ffmpeg_err
+            finally:
+                if ffmpeg_decode_path and os.path.exists(ffmpeg_decode_path):
+                    try:
+                        os.remove(ffmpeg_decode_path)
+                    except Exception:
+                        pass
     channels = waveform.shape[0]
     min_val = waveform.min().item()
     max_val = waveform.max().item()
@@ -325,14 +381,19 @@ def ensure_prompt_audio_format(audio_path, target_sr=PROMPT_TARGET_SAMPLE_RATE):
         waveform = resampler(waveform)
         sample_rate = target_sr
 
+    info_sample_rate = None
+    info_channels = None
+    if info is not None:
+        info_sample_rate = getattr(info, "sample_rate", getattr(info, "samplerate", None))
+        info_channels = getattr(info, "num_channels", getattr(info, "channels", None))
+
     already_compliant = (
         not needs_mono
         and not needs_resample
         and not exceeds_range
-        and info is not None
-        and getattr(info, "sample_rate", None) == target_sr
-        and getattr(info, "num_channels", None) == PROMPT_EXPECTED_CHANNELS
-        and bits_per_sample == 16
+        and info_sample_rate == target_sr
+        and info_channels == PROMPT_EXPECTED_CHANNELS
+        and bits_per_sample in (16, "PCM_16", "PCM_16LE")
     )
 
     if already_compliant:
