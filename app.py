@@ -676,6 +676,16 @@ S3_PREFIX = os.environ.get("S3_PREFIX") or os.environ.get("S3_DIR") or "uploads"
 S3_REGION = os.environ.get("S3_REGION") or os.environ.get("AWS_DEFAULT_REGION")
 AWS_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+LOG_FILE_PATH = os.environ.get("APP_LOG_PATH", "/app/app.log")
+S3_LOG_UPLOAD_ENABLED = os.environ.get("S3_LOG_UPLOAD_ENABLED", "true").lower() in ("true", "1", "yes")
+S3_LOG_UPLOAD_INTERVAL_SECONDS = int(os.environ.get("S3_LOG_UPLOAD_INTERVAL_SECONDS", "10"))
+
+_default_log_prefix = None
+if S3_PREFIX:
+    _default_log_prefix = f"{S3_PREFIX.rstrip('/')}/logs"
+S3_LOG_PREFIX = os.environ.get("S3_LOG_PREFIX") or _default_log_prefix or "logs"
+S3_LOG_UPLOAD_STOP = threading.Event()
+S3_LOG_UPLOAD_THREAD = None
 
 _s3_client = None
 
@@ -799,6 +809,48 @@ def get_s3_upload_status():
     except Exception as e:
         logger.warning(f"Error getting S3 upload status: {e}")
         return {"error": str(e)}
+
+
+def start_periodic_log_upload(log_path=LOG_FILE_PATH):
+    """Launch a daemon thread that ships the application log to S3 on an interval."""
+    global S3_LOG_UPLOAD_THREAD
+
+    if not S3_LOG_UPLOAD_ENABLED:
+        logger.info("Periodic log upload disabled by configuration")
+        return
+
+    if not S3_BUCKET:
+        logger.info("S3_BUCKET not configured; periodic log upload disabled")
+        return
+
+    if S3_LOG_UPLOAD_THREAD and S3_LOG_UPLOAD_THREAD.is_alive():
+        return
+
+    def upload_loop():
+        logger.info(
+            f"Periodic log upload thread started (interval: {S3_LOG_UPLOAD_INTERVAL_SECONDS}s, key prefix: {S3_LOG_PREFIX})"
+        )
+        while not S3_LOG_UPLOAD_STOP.is_set():
+            try:
+                if os.path.exists(log_path):
+                    result = s3_upload_file(log_path, key_prefix=S3_LOG_PREFIX)
+                    if isinstance(result, dict) and result.get("error"):
+                        logger.warning(f"Periodic log upload failed: {result['error']}")
+                else:
+                    logger.warning(f"Periodic log upload skipped; log file missing at {log_path}")
+            except Exception as upload_err:
+                logger.warning(f"Periodic log upload raised exception: {upload_err}")
+
+            if S3_LOG_UPLOAD_STOP.wait(S3_LOG_UPLOAD_INTERVAL_SECONDS):
+                break
+
+        logger.info("Periodic log upload thread stopping")
+
+    S3_LOG_UPLOAD_THREAD = threading.Thread(target=upload_loop, name="log-uploader", daemon=True)
+    S3_LOG_UPLOAD_THREAD.start()
+
+
+start_periodic_log_upload()
 
 def transcribe_whisper(audio_file, sample_rate=24000):
     logger.info(f"Whisper transcription started for file: {audio_file}")
@@ -1360,6 +1412,7 @@ if __name__ == "__main__":
             except Exception as e:
                 logger.warning(f"Error shutting down S3 upload executor: {e}")
             
+            S3_LOG_UPLOAD_STOP.set()
             perform_pod_shutdown(shutdown_reason=f"signal:{signum}", logger=logger)
             sys.exit(0)
         
@@ -1397,6 +1450,14 @@ if __name__ == "__main__":
             
         sys.exit(1)
     finally:
+        S3_LOG_UPLOAD_STOP.set()
+        if S3_LOG_UPLOAD_THREAD and S3_LOG_UPLOAD_THREAD.is_alive():
+            logger.info("Stopping periodic log upload thread...")
+            try:
+                S3_LOG_UPLOAD_THREAD.join(timeout=5)
+            except Exception as join_err:
+                logger.warning(f"Error stopping log upload thread: {join_err}")
+
         # Shutdown S3 upload executor
         logger.info("Shutting down S3 upload executor...")
         try:

@@ -63,6 +63,26 @@ if [ "$AVAILABLE_MEMORY" -lt 4000000000 ]; then
     exit 1
 fi
 
+# Check network connectivity
+echo "Checking network connectivity..."
+if ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1; then
+    echo "✓ Network connectivity OK (can reach 8.8.8.8)"
+else
+    echo "⚠ WARNING: No network connectivity detected"
+    echo "  - Whisper model downloads will fail"
+    echo "  - Application will use cached models only"
+fi
+
+# Check DNS resolution
+if nslookup openaipublic.azureedge.net > /dev/null 2>&1; then
+    echo "✓ DNS resolution OK"
+else
+    echo "⚠ WARNING: DNS resolution failing"
+    echo "  - Model downloads may fail"
+    echo "  - Checking DNS servers..."
+    cat /etc/resolv.conf 2>/dev/null || echo "  - Cannot read /etc/resolv.conf"
+fi
+
 # Step 0: Setup network storage (if possible)
 echo "Step 0: Setting up storage strategy..."
 echo "Attempting to setup network storage..."
@@ -196,7 +216,7 @@ echo "=================================================="
 # Start the application and capture its PID
 echo "Starting application..."
 # Start python directly so APP_PID reflects python, not tee.
-python app.py >> app.log 2>&1 &
+python app.py &
 APP_PID=$!
 echo "✓ Main application started (PID: $APP_PID)"
 # Stream logs to console in background for visibility
