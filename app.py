@@ -9,6 +9,10 @@ torch_use_cuda_dsa_override = os.environ.get("TORCH_USE_CUDA_DSA_OVERRIDE")
 if torch_use_cuda_dsa_override is not None:
     os.environ["TORCH_USE_CUDA_DSA"] = torch_use_cuda_dsa_override
 
+torch_disable_addr2line_override = os.environ.get("TORCH_DISABLE_ADDR2LINE_OVERRIDE")
+if torch_disable_addr2line_override is not None:
+    os.environ["TORCH_DISABLE_ADDR2LINE"] = torch_disable_addr2line_override
+
 import gradio as gr
 import whisper
 from vosk import Model, KaldiRecognizer
@@ -51,6 +55,9 @@ if cuda_launch_blocking_override is not None:
 
 if torch_use_cuda_dsa_override is not None:
     logger.info(f"TORCH_USE_CUDA_DSA override applied: {torch_use_cuda_dsa_override}")
+
+if torch_disable_addr2line_override is not None:
+    logger.info(f"TORCH_DISABLE_ADDR2LINE override applied: {torch_disable_addr2line_override}")
 
 # Set up specific loggers for different components
 gradio_logger = logging.getLogger('gradio')
