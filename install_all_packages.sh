@@ -13,6 +13,8 @@ LOCAL_PACKAGES_DIR="/app/python-packages"
 # All packages (both heavy and light)
 ALL_PACKAGES=(
     "gradio"
+    "fastapi"
+    "uvicorn[standard]"
     "numpy==1.26.4"
     "librosa" 
     "psutil"
@@ -21,7 +23,7 @@ ALL_PACKAGES=(
     "requests"
     "git+https://github.com/openai/whisper.git"
     "vosk"
-    "git+https://github.com/rsxdalv/chatterbox.git@faster"
+    "git+https://github.com/thequiet/chatterbox.git@faster"
     "peft"
     "torch torchaudio --index-url https://download.pytorch.org/whl/cu121"
     "triton>=2.0.0"

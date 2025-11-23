@@ -1,0 +1,35 @@
+FROM python:3.11-slim
+
+# Install only system dependencies and essential Python packages
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    git \
+    curl \
+    unzip \
+    coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install only pip (no Python packages in image)
+RUN pip install --no-cache-dir --upgrade pip
+
+# Set working directory
+WORKDIR /app
+
+# Copy only application code and scripts
+COPY app.py /app/app.py
+COPY pod_shutdown.py /app/pod_shutdown.py
+COPY download_models.sh /app/download_models.sh
+COPY setup_network_volume.py /app/setup_network_volume.py
+COPY stop_inactive_pod.py /app/stop_inactive_pod.py
+COPY install_all_packages.sh /app/install_all_packages.sh
+COPY start_ultra_slim.sh /app/start.sh
+RUN chmod +x /app/*.sh
+
+# Create local directories for fallback
+RUN mkdir -p /app/models /app/packages
+
+# Expose Gradio and HearsAid API ports
+EXPOSE 7860 7861
+
+# Use the startup script
+CMD ["./start.sh"]

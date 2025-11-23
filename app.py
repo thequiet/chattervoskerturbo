@@ -30,7 +30,12 @@ import subprocess
 import tempfile
 import signal
 import uuid
+import asyncio
+import zipfile
+import shutil
 from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 from chatterbox.tts import ChatterboxTTS
 import boto3
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
@@ -38,6 +43,17 @@ from pod_shutdown import perform_pod_shutdown
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import queue
+
+from fastapi import (
+    FastAPI,
+    APIRouter,
+    UploadFile,
+    File,
+    HTTPException,
+    BackgroundTasks,
+)
+from pydantic import BaseModel
+import uvicorn
 
 # Configure enhanced logging
 logging.basicConfig(
@@ -89,6 +105,14 @@ AUDIO_LIMITER_RATIO = float(os.environ.get("AUDIO_LIMITER_RATIO", "8.0"))
 PROMPT_TARGET_SAMPLE_RATE = 24000
 PROMPT_EXPECTED_CHANNELS = 1
 PROMPT_SANITIZED_DIR = "/tmp/chatterbox_prompts"
+AUDIO_OUTPUT_DIR = "/app/audio/output"
+
+HEARSAID_API_HOST = os.environ.get("HEARSAID_API_HOST", "0.0.0.0")
+HEARSAID_API_PORT = int(os.environ.get("HEARSAID_API_PORT", "7861"))
+HEARSAID_API_BASE_PATH = os.environ.get("HEARSAID_API_BASE_PATH", "/hearsaid-api") or "/hearsaid-api"
+HEARSAID_API_BASE_PATH = "/" + HEARSAID_API_BASE_PATH.strip("/")
+HEARSAID_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024
+HEARSAID_ALLOWED_EXTENSIONS = {".wav", ".mp3", ".zip"}
 
 logger.info(f"Skip audio conversion: {SKIP_AUDIO_CONVERSION}")
 logger.info(f"Audio normalization enabled: {AUDIO_NORMALIZATION_ENABLED}")
@@ -818,6 +842,231 @@ def get_s3_upload_status():
         return {"error": str(e)}
 
 
+# HearsAid API (FastAPI) -----------------------------------------------------
+class AudiobookStatusPayload(BaseModel):
+    status: str
+    detail: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+HEARSAID_API_APP = FastAPI(
+    title="HearsAid API",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+hearsaid_router = APIRouter(prefix=HEARSAID_API_BASE_PATH, tags=["hearsaid"])
+
+HEARSAID_SERVER: Optional[uvicorn.Server] = None
+HEARSAID_SERVER_THREAD: Optional[threading.Thread] = None
+
+
+def validate_upload_filename(filename: Optional[str]) -> str:
+    if filename is None:
+        raise ValueError("Filename is required")
+
+    raw_name = filename
+    if raw_name.strip() == "":
+        raise ValueError("Filename cannot be empty")
+
+    if "\x00" in raw_name:
+        raise ValueError("Filename contains null bytes")
+
+    if os.path.isabs(raw_name):
+        raise ValueError("Absolute paths are not allowed in filenames")
+
+    if os.path.basename(raw_name) != raw_name or "\\" in raw_name:
+        raise ValueError("Filename must not contain path separators")
+
+    if raw_name in {".", ".."}:
+        raise ValueError("Reserved filenames are not allowed")
+
+    if len(raw_name) > 255:
+        raise ValueError("Filename is too long")
+
+    return raw_name
+
+
+def safe_join(base_dir: str, *paths: str) -> str:
+    candidate = os.path.realpath(os.path.join(base_dir, *paths))
+    base_real = os.path.realpath(base_dir)
+    if not candidate.startswith(base_real.rstrip(os.sep) + os.sep) and candidate != base_real:
+        raise ValueError("Path traversal detected in archive member")
+    return candidate
+
+
+def safe_extract_zip(zip_path: str, target_dir: str) -> List[str]:
+    extracted_files: List[str] = []
+    with zipfile.ZipFile(zip_path) as archive:
+        for member in archive.infolist():
+            normalized_name = os.path.normpath(member.filename)
+            if normalized_name.startswith("..") or normalized_name.startswith("/"):
+                raise ValueError(f"Unsafe path inside zip: {member.filename}")
+            if normalized_name.startswith("__MACOSX"):
+                continue  # skip macOS metadata folders
+            destination_path = safe_join(target_dir, normalized_name)
+            if member.is_dir():
+                os.makedirs(destination_path, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+            with archive.open(member) as src, open(destination_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted_files.append(destination_path)
+    return extracted_files
+
+
+async def persist_uploaded_file(upload: UploadFile, destination: str) -> int:
+    total_bytes = 0
+    with open(destination, "wb") as out_file:
+        while True:
+            chunk = await upload.read(HEARSAID_UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            out_file.write(chunk)
+            total_bytes += len(chunk)
+    await upload.close()
+    return total_bytes
+
+
+def schedule_pod_shutdown(reason: str):
+    def _shutdown_task():
+        try:
+            perform_pod_shutdown(shutdown_reason=reason, logger=logger)
+        except Exception as shutdown_err:
+            logger.error(f"Pod shutdown routine raised: {shutdown_err}")
+        finally:
+            logger.info("Exiting pod process after HearsAid shutdown request")
+            os._exit(0)
+
+    threading.Thread(target=_shutdown_task, name="hearsaid-shutdown", daemon=True).start()
+
+
+@hearsaid_router.post("/audiobook-status")
+async def update_audiobook_status(
+    payload: AudiobookStatusPayload,
+    background_tasks: BackgroundTasks,
+):
+    status_value = (payload.status or "").strip().lower()
+    if status_value == "processing":
+        logger.info(
+            "Audiobook processing heartbeat received%s",
+            f": {payload.detail}" if payload.detail else "",
+        )
+        return {
+            "status": "acknowledged",
+            "action": "heartbeat",
+            "detail": payload.detail,
+        }
+    if status_value == "exited":
+        logger.info("Audiobook processor reported exit; scheduling pod shutdown")
+        background_tasks.add_task(schedule_pod_shutdown, "audiobook_status_exit")
+        return {
+            "status": "acknowledged",
+            "action": "shutdown",
+            "detail": payload.detail,
+        }
+
+    raise HTTPException(status_code=400, detail="Unsupported status. Use 'processing' or 'exited'.")
+
+
+@hearsaid_router.post("/audio-upload")
+async def upload_audio(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Uploaded file is missing a filename")
+
+    try:
+        original_name = validate_upload_filename(file.filename)
+    except ValueError as validation_err:
+        raise HTTPException(status_code=400, detail=str(validation_err)) from validation_err
+
+    extension = os.path.splitext(original_name)[1].lower()
+    if extension not in HEARSAID_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Allowed: wav, mp3, zip.",
+        )
+
+    os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
+    destination_path = os.path.join(AUDIO_OUTPUT_DIR, original_name)
+    logger.info(f"Receiving upload for {original_name} -> {destination_path}")
+
+    bytes_written = await persist_uploaded_file(file, destination_path)
+
+    response: Dict[str, Any] = {
+        "filename": original_name,
+        "saved_path": destination_path,
+        "bytes_written": bytes_written,
+    }
+
+    if extension == ".zip":
+        if not zipfile.is_zipfile(destination_path):
+            logger.error("Uploaded file %s is not a valid zip archive", destination_path)
+            raise HTTPException(status_code=400, detail="Uploaded file is not a valid zip archive")
+        try:
+            extracted_files = safe_extract_zip(destination_path, AUDIO_OUTPUT_DIR)
+            response["unzipped_files"] = extracted_files
+            logger.info(
+                "Stored zip %s and extracted %d entries", destination_path, len(extracted_files)
+            )
+        except Exception as zip_err:
+            logger.error(f"Failed to extract {destination_path}: {zip_err}")
+            raise HTTPException(status_code=400, detail=f"Zip extraction failed: {zip_err}")
+    else:
+        logger.info(
+            "Stored audio upload %s (%s) - %.2f MB",
+            destination_path,
+            extension,
+            bytes_written / (1024 * 1024) if bytes_written else 0,
+        )
+
+    return response
+
+
+HEARSAID_API_APP.include_router(hearsaid_router)
+
+
+def start_hearsaid_api_server():
+    global HEARSAID_SERVER, HEARSAID_SERVER_THREAD
+    if HEARSAID_SERVER_THREAD and HEARSAID_SERVER_THREAD.is_alive():
+        return HEARSAID_SERVER_THREAD
+
+    config = uvicorn.Config(
+        HEARSAID_API_APP,
+        host=HEARSAID_API_HOST,
+        port=HEARSAID_API_PORT,
+        log_level="info",
+    )
+    HEARSAID_SERVER = uvicorn.Server(config)
+
+    def _run_server():
+        logger.info(
+            "Starting HearsAid API on %s:%s with prefix %s",
+            HEARSAID_API_HOST,
+            HEARSAID_API_PORT,
+            HEARSAID_API_BASE_PATH,
+        )
+        try:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            HEARSAID_SERVER.run()
+        except Exception as server_err:
+            logger.error(f"HearsAid API server crashed: {server_err}")
+
+    HEARSAID_SERVER_THREAD = threading.Thread(
+        target=_run_server,
+        name="hearsaid-api-server",
+        daemon=True,
+    )
+    HEARSAID_SERVER_THREAD.start()
+    return HEARSAID_SERVER_THREAD
+
+
+def stop_hearsaid_api_server():
+    if HEARSAID_SERVER is not None:
+        HEARSAID_SERVER.should_exit = True
+    if HEARSAID_SERVER_THREAD is not None and HEARSAID_SERVER_THREAD.is_alive():
+        HEARSAID_SERVER_THREAD.join(timeout=5)
+
+
 def start_periodic_log_upload(log_path=LOG_FILE_PATH):
     """Launch a daemon thread that ships the application log to S3 on an interval."""
     global S3_LOG_UPLOAD_THREAD
@@ -1019,7 +1268,7 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
         logger.info(f"Parameters - exaggeration: {exaggeration}, cfg_weight: {cfg_weight}, temperature: {temperature}, seed: {random_seed}, custom_filename: {output_filename}")
         
         # Create output directory if it doesn't exist
-        output_dir = "/app/audio/output"
+        output_dir = AUDIO_OUTPUT_DIR
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Output directory ensured: {output_dir}")
         
@@ -1406,10 +1655,13 @@ if __name__ == "__main__":
         logger.info("Starting Gradio application...")
         logger.info(f"Server configuration: 0.0.0.0:7860")
         logger.info("="*50)
+
+        start_hearsaid_api_server()
         
         # Add signal handlers for graceful shutdown
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, shutting down gracefully...")
+            stop_hearsaid_api_server()
             
             # Shutdown S3 upload executor
             logger.info("Shutting down S3 upload executor...")
@@ -1443,6 +1695,7 @@ if __name__ == "__main__":
         
         # Try to clean up resources
         try:
+            stop_hearsaid_api_server()
             # Shutdown S3 upload executor
             logger.info("Shutting down S3 upload executor...")
             try:
@@ -1457,6 +1710,7 @@ if __name__ == "__main__":
             
         sys.exit(1)
     finally:
+        stop_hearsaid_api_server()
         S3_LOG_UPLOAD_STOP.set()
         if S3_LOG_UPLOAD_THREAD and S3_LOG_UPLOAD_THREAD.is_alive():
             logger.info("Stopping periodic log upload thread...")
