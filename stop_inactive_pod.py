@@ -50,6 +50,7 @@ ACTIVITY_PATTERNS = [
     r"generation_time_seconds",
     r"audio_file.*\.wav",
     r"Application.*started",
+    r"Audiobook processing heartbeat",
 ]
 
 _s3_client = None
