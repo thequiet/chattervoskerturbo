@@ -126,6 +126,29 @@ S3_UPLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=5, thread_name_prefix="s3-up
 S3_UPLOAD_FUTURES = queue.Queue()
 logger.info("Initialized S3 upload thread pool with 5 workers")
 
+# Vosk batch transcription configuration
+# Uses multi-threading to parallelize I/O-bound transcription tasks across CPU cores
+# ThreadPoolExecutors are created on-demand per batch request to avoid global state issues
+def _detect_optimal_workers():
+    """Auto-detect optimal worker count based on available CPU cores.
+    
+    Returns the number of workers, which can be overridden via VOSK_BATCH_MAX_WORKERS env var.
+    Uses os.cpu_count() to detect available vCPUs on RunPod pods.
+    Reserves 1 core for the main process and system overhead.
+    """
+    env_override = os.environ.get("VOSK_BATCH_MAX_WORKERS")
+    if env_override:
+        return int(env_override)
+    
+    cpu_count = os.cpu_count() or 4  # Default to 4 if detection fails
+    # Use all cores minus 1 for overhead, minimum of 2 workers
+    optimal = max(2, cpu_count - 1)
+    return optimal
+
+VOSK_BATCH_MAX_WORKERS = _detect_optimal_workers()
+_detected_cpus = os.cpu_count() or "unknown"
+logger.info(f"Detected {_detected_cpus} CPU cores, using {VOSK_BATCH_MAX_WORKERS} worker threads for Vosk batch transcription")
+
 # Load models
 logger.info("Initializing models...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -941,6 +964,41 @@ def schedule_pod_shutdown(reason: str):
     threading.Thread(target=_shutdown_task, name="hearsaid-shutdown", daemon=True).start()
 
 
+def list_audio_output_files() -> List[Dict[str, Any]]:
+    """Return metadata for files within the audio output directory."""
+    if not os.path.exists(AUDIO_OUTPUT_DIR):
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    for entry in os.scandir(AUDIO_OUTPUT_DIR):
+        if not entry.is_file():
+            continue
+        try:
+            stat_info = entry.stat()
+            entries.append(
+                {
+                    "name": entry.name,
+                    "size_bytes": stat_info.st_size,
+                    "modified": datetime.fromtimestamp(stat_info.st_mtime).isoformat() + "Z",
+                }
+            )
+        except FileNotFoundError:
+            # File disappeared between scandir and stat; skip it
+            continue
+    entries.sort(key=lambda item: item["name"].lower())
+    return entries
+
+
+@hearsaid_router.get("/health")
+async def hearsaid_health_check():
+    """Simple readiness probe for the RunPod proxy."""
+    return {
+        "status": "ok",
+        "service": "hearsaid-api",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+
 @hearsaid_router.post("/audiobook-status")
 async def update_audiobook_status(
     payload: AudiobookStatusPayload,
@@ -967,6 +1025,20 @@ async def update_audiobook_status(
         }
 
     raise HTTPException(status_code=400, detail="Unsupported status. Use 'processing' or 'exited'.")
+
+
+@hearsaid_router.get("/audio-files")
+async def list_audio_files():
+    try:
+        files = list_audio_output_files()
+        return {
+            "directory": AUDIO_OUTPUT_DIR,
+            "count": len(files),
+            "files": files,
+        }
+    except Exception as err:
+        logger.error(f"Failed to list audio files: {err}")
+        raise HTTPException(status_code=500, detail="Unable to list audio output files") from err
 
 
 @hearsaid_router.post("/audio-upload")
@@ -1258,6 +1330,201 @@ def transcribe_vosk_filepath(file_path, sample_rate=24000):
     
     # Use the existing transcribe_vosk function
     return transcribe_vosk(file_path, sample_rate)
+
+
+def _transcribe_vosk_single(args):
+    """Internal helper for parallel transcription. Accepts (file_path, sample_rate) tuple.
+    
+    This function is designed to be called by ThreadPoolExecutor.map() for batch processing.
+    The vosk_model is loaded once globally and reused across all threads.
+    """
+    file_path, sample_rate, file_index, total_files = args
+    logger.info(f"[Batch {file_index + 1}/{total_files}] Starting transcription: {os.path.basename(file_path)}")
+    
+    try:
+        result = transcribe_vosk(file_path, sample_rate)
+        result["batch_index"] = file_index
+        result["source_file"] = file_path
+        return result
+    except Exception as e:
+        error_msg = f"Transcription failed for {file_path}: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "error": error_msg,
+            "batch_index": file_index,
+            "source_file": file_path
+        }
+
+
+def transcribe_vosk_batch(audio_files, sample_rate=24000):
+    """
+    Batch transcription using VOSK with multi-threading for parallel processing.
+    
+    Leverages multi-core CPU resources on RunPod pods (typically 4-8 vCPUs) to
+    transcribe multiple files in parallel. The VOSK model is loaded once globally
+    and reused across all threads to avoid memory overhead.
+    
+    Args:
+        audio_files: List of audio file paths (from Gradio file uploads)
+        sample_rate: Target sample rate for audio conversion (default: 24000)
+    
+    Returns:
+        dict: Batch transcription results with individual results for each file
+    """
+    logger.info(f"VOSK batch transcription started for {len(audio_files)} files")
+    start_time = datetime.now()
+    
+    if vosk_model is None:
+        logger.error("VOSK model not available. Batch transcription disabled.")
+        return {"error": "VOSK model not available", "results": []}
+    
+    if not audio_files or len(audio_files) == 0:
+        return {"error": "No audio files provided", "results": []}
+    
+    # Prepare arguments for parallel processing
+    total_files = len(audio_files)
+    args_list = [(f, sample_rate, i, total_files) for i, f in enumerate(audio_files)]
+    
+    logger.info(f"Processing {total_files} files with {VOSK_BATCH_MAX_WORKERS} worker threads...")
+    
+    # Use thread pool for parallel transcription
+    results = []
+    successful = 0
+    failed = 0
+    
+    try:
+        # Use a new executor context for each batch to avoid global executor shutdown issues
+        with ThreadPoolExecutor(max_workers=VOSK_BATCH_MAX_WORKERS, thread_name_prefix="vosk-batch") as executor:
+            future_results = list(executor.map(_transcribe_vosk_single, args_list))
+        
+        for result in future_results:
+            results.append(result)
+            if "error" in result:
+                failed += 1
+            else:
+                successful += 1
+                
+    except Exception as e:
+        error_msg = f"Batch transcription failed: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        return {"error": error_msg, "results": results}
+    
+    duration = (datetime.now() - start_time).total_seconds()
+    
+    batch_result = {
+        "total_files": total_files,
+        "successful": successful,
+        "failed": failed,
+        "processing_time_seconds": round(duration, 2),
+        "avg_time_per_file_seconds": round(duration / total_files, 2) if total_files > 0 else 0,
+        "worker_threads": VOSK_BATCH_MAX_WORKERS,
+        "sample_rate": sample_rate,
+        "results": results
+    }
+    
+    logger.info(f"✓ VOSK batch transcription completed in {duration:.2f}s")
+    logger.info(f"  - Total: {total_files}, Successful: {successful}, Failed: {failed}")
+    logger.info(f"  - Average time per file: {batch_result['avg_time_per_file_seconds']:.2f}s")
+    
+    return batch_result
+
+
+def transcribe_vosk_batch_filepath(file_paths_text, sample_rate=24000):
+    """
+    Batch transcription using VOSK with multi-threading for server-side file paths.
+    
+    Accepts a newline-separated list of file paths on the server and processes
+    them in parallel using the thread pool.
+    
+    Args:
+        file_paths_text: Newline-separated string of file paths on the server
+        sample_rate: Target sample rate for audio conversion (default: 24000)
+    
+    Returns:
+        dict: Batch transcription results with individual results for each file
+    """
+    logger.info("VOSK batch filepath transcription started")
+    start_time = datetime.now()
+    
+    if vosk_model is None:
+        logger.error("VOSK model not available. Batch transcription disabled.")
+        return {"error": "VOSK model not available", "results": []}
+    
+    if not file_paths_text or not file_paths_text.strip():
+        return {"error": "No file paths provided", "results": []}
+    
+    # Parse file paths from text input (one per line)
+    file_paths = [p.strip() for p in file_paths_text.strip().split('\n') if p.strip()]
+    
+    # Validate all paths exist
+    valid_paths = []
+    invalid_paths = []
+    for path in file_paths:
+        if os.path.exists(path):
+            valid_paths.append(path)
+        else:
+            invalid_paths.append(path)
+            logger.warning(f"File not found: {path}")
+    
+    if not valid_paths:
+        return {
+            "error": "No valid file paths found",
+            "invalid_paths": invalid_paths,
+            "results": []
+        }
+    
+    total_files = len(valid_paths)
+    logger.info(f"Processing {total_files} valid files with {VOSK_BATCH_MAX_WORKERS} worker threads...")
+    
+    # Prepare arguments for parallel processing
+    args_list = [(f, sample_rate, i, total_files) for i, f in enumerate(valid_paths)]
+    
+    # Use thread pool for parallel transcription
+    results = []
+    successful = 0
+    failed = 0
+    
+    try:
+        # Use a new executor context to avoid issues with reusing the global one
+        with ThreadPoolExecutor(max_workers=VOSK_BATCH_MAX_WORKERS, thread_name_prefix="vosk-batch-fp") as executor:
+            future_results = list(executor.map(_transcribe_vosk_single, args_list))
+        
+        for result in future_results:
+            results.append(result)
+            if "error" in result:
+                failed += 1
+            else:
+                successful += 1
+                
+    except Exception as e:
+        error_msg = f"Batch transcription failed: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        return {"error": error_msg, "results": results}
+    
+    duration = (datetime.now() - start_time).total_seconds()
+    
+    batch_result = {
+        "total_files": total_files,
+        "successful": successful,
+        "failed": failed,
+        "invalid_paths": invalid_paths,
+        "processing_time_seconds": round(duration, 2),
+        "avg_time_per_file_seconds": round(duration / total_files, 2) if total_files > 0 else 0,
+        "worker_threads": VOSK_BATCH_MAX_WORKERS,
+        "sample_rate": sample_rate,
+        "results": results
+    }
+    
+    logger.info(f"✓ VOSK batch filepath transcription completed in {duration:.2f}s")
+    logger.info(f"  - Total: {total_files}, Successful: {successful}, Failed: {failed}")
+    if invalid_paths:
+        logger.info(f"  - Invalid paths skipped: {len(invalid_paths)}")
+    logger.info(f"  - Average time per file: {batch_result['avg_time_per_file_seconds']:.2f}s")
+    
+    return batch_result
+
 
 def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None, skip_conversion=None):
     logger.info(f"Chatterbox TTS started for text: '{text[:100]}{'...' if len(text) > 100 else ''}'")
@@ -1618,6 +1885,46 @@ try:
     )
     logger.info("✓ VOSK filepath interface created")
 
+    logger.info("Creating VOSK batch interface...")
+    vosk_batch_iface = gr.Interface(
+        fn=transcribe_vosk_batch,
+        inputs=[
+            gr.File(
+                file_count="multiple",
+                file_types=["audio"],
+                label="Upload multiple audio files for batch transcription",
+                type="filepath"
+            ),
+            gr.Number(label="Sample Rate", value=24000, precision=0, info="Target sample rate for audio conversion (Hz)")
+        ],
+        outputs=gr.JSON(label="Batch Results"),
+        title=f"VOSK Batch Transcription (Multi-threaded: {VOSK_BATCH_MAX_WORKERS} workers)",
+        description=f"Upload multiple audio files to transcribe them in parallel using {VOSK_BATCH_MAX_WORKERS} CPU threads. "
+                    "Leverages multi-core CPU resources on RunPod pods for faster batch processing.",
+        api_name="vosk_batch"
+    )
+    logger.info("✓ VOSK batch interface created")
+
+    logger.info("Creating VOSK batch filepath interface...")
+    vosk_batch_filepath_iface = gr.Interface(
+        fn=transcribe_vosk_batch_filepath,
+        inputs=[
+            gr.Textbox(
+                label="Server File Paths",
+                placeholder="/app/audio/output/file1.wav\n/app/audio/output/file2.wav\n/app/audio/output/file3.wav",
+                info="Enter one file path per line. Files must exist on the server.",
+                lines=10
+            ),
+            gr.Number(label="Sample Rate", value=24000, precision=0, info="Target sample rate for audio conversion (Hz)")
+        ],
+        outputs=gr.JSON(label="Batch Results"),
+        title=f"VOSK Batch Transcription - Server Files (Multi-threaded: {VOSK_BATCH_MAX_WORKERS} workers)",
+        description=f"Process multiple server-side audio files in parallel using {VOSK_BATCH_MAX_WORKERS} CPU threads. "
+                    "Enter one file path per line.",
+        api_name="vosk_batch_filepath"
+    )
+    logger.info("✓ VOSK batch filepath interface created")
+
     logger.info("Creating Chatterbox interface...")
     chatterbox_iface = gr.Interface(
         fn=chatterbox_clone_gradio,
@@ -1640,8 +1947,12 @@ try:
     logger.info("✓ Chatterbox interface created")
 
     logger.info("Creating tabbed interface...")
-    app = gr.TabbedInterface([whisper_iface, whisper_filepath_iface, vosk_iface, vosk_filepath_iface, chatterbox_iface], 
-                           ["Whisper", "Whisper Files", "VOSK", "VOSK Files", "Chatterbox"])
+    app = gr.TabbedInterface(
+        [whisper_iface, whisper_filepath_iface, vosk_iface, vosk_filepath_iface, 
+         vosk_batch_iface, vosk_batch_filepath_iface, chatterbox_iface], 
+        ["Whisper", "Whisper Files", "VOSK", "VOSK Files", 
+         "VOSK Batch", "VOSK Batch Files", "Chatterbox"]
+    )
     logger.info("✓ All Gradio interfaces created successfully")
 
 except Exception as e:
