@@ -741,6 +741,16 @@ S3_LOG_PREFIX = os.environ.get("S3_LOG_PREFIX") or _default_log_prefix or "logs"
 S3_LOG_UPLOAD_STOP = threading.Event()
 S3_LOG_UPLOAD_THREAD = None
 
+# Audiobook heartbeat watchdog configuration
+HEARTBEAT_WATCHDOG_ENABLED = os.environ.get("HEARTBEAT_WATCHDOG_ENABLED", "true").lower() in ("true", "1", "yes")
+HEARTBEAT_WATCHDOG_TIMEOUT_SECONDS = int(os.environ.get("HEARTBEAT_WATCHDOG_TIMEOUT_SECONDS", "3600"))  # 1 hour
+HEARTBEAT_WATCHDOG_CHECK_INTERVAL = int(os.environ.get("HEARTBEAT_WATCHDOG_CHECK_INTERVAL", "60"))  # Check every minute
+_heartbeat_watchdog_lock = threading.Lock()
+_heartbeat_first_seen = None
+_heartbeat_last_other_activity = None
+_heartbeat_watchdog_stop = threading.Event()
+_heartbeat_watchdog_thread = None
+
 _s3_client = None
 
 def get_s3_client():
@@ -863,6 +873,110 @@ def get_s3_upload_status():
     except Exception as e:
         logger.warning(f"Error getting S3 upload status: {e}")
         return {"error": str(e)}
+
+
+# Audiobook heartbeat watchdog functions
+def _record_heartbeat():
+    """Record that a heartbeat was received"""
+    global _heartbeat_first_seen
+    with _heartbeat_watchdog_lock:
+        if _heartbeat_first_seen is None:
+            _heartbeat_first_seen = datetime.now()
+            logger.info(f"Watchdog: First audiobook heartbeat recorded at {_heartbeat_first_seen}")
+
+
+def _record_other_activity():
+    """Record that non-heartbeat activity occurred"""
+    global _heartbeat_last_other_activity
+    with _heartbeat_watchdog_lock:
+        _heartbeat_last_other_activity = datetime.now()
+        logger.debug(f"Watchdog: Non-heartbeat activity recorded at {_heartbeat_last_other_activity}")
+
+
+def _check_heartbeat_timeout():
+    """Check if only heartbeats have occurred for too long"""
+    with _heartbeat_watchdog_lock:
+        if _heartbeat_first_seen is None:
+            # No heartbeats yet, nothing to check
+            return False
+        
+        now = datetime.now()
+        
+        # If we've seen other activity, check time since last other activity
+        if _heartbeat_last_other_activity is not None:
+            time_since_activity = (now - _heartbeat_last_other_activity).total_seconds()
+        else:
+            # No other activity yet, check time since first heartbeat
+            time_since_activity = (now - _heartbeat_first_seen).total_seconds()
+        
+        if time_since_activity >= HEARTBEAT_WATCHDOG_TIMEOUT_SECONDS:
+            logger.warning(
+                f"Watchdog timeout triggered! Only heartbeats for {time_since_activity:.0f}s "
+                f"(threshold: {HEARTBEAT_WATCHDOG_TIMEOUT_SECONDS}s)"
+            )
+            return True
+        
+        return False
+
+
+def _heartbeat_watchdog_loop():
+    """Background thread that monitors heartbeat activity"""
+    logger.info(
+        f"Heartbeat watchdog started (timeout: {HEARTBEAT_WATCHDOG_TIMEOUT_SECONDS}s, "
+        f"check interval: {HEARTBEAT_WATCHDOG_CHECK_INTERVAL}s)"
+    )
+    
+    while not _heartbeat_watchdog_stop.is_set():
+        try:
+            if _check_heartbeat_timeout():
+                logger.error("Triggering pod shutdown due to heartbeat timeout")
+                schedule_pod_shutdown("heartbeat_watchdog_timeout")
+                break
+        except Exception as e:
+            logger.error(f"Watchdog check error: {e}")
+        
+        # Wait for check interval or stop signal
+        if _heartbeat_watchdog_stop.wait(HEARTBEAT_WATCHDOG_CHECK_INTERVAL):
+            break
+    
+    logger.info("Heartbeat watchdog stopped")
+
+
+def start_heartbeat_watchdog():
+    """Start the heartbeat watchdog thread"""
+    global _heartbeat_watchdog_thread
+    
+    if not HEARTBEAT_WATCHDOG_ENABLED:
+        logger.info("Heartbeat watchdog disabled by configuration")
+        return
+    
+    if _heartbeat_watchdog_thread and _heartbeat_watchdog_thread.is_alive():
+        logger.debug("Heartbeat watchdog already running")
+        return
+    
+    _heartbeat_watchdog_thread = threading.Thread(
+        target=_heartbeat_watchdog_loop,
+        name="heartbeat-watchdog",
+        daemon=True
+    )
+    _heartbeat_watchdog_thread.start()
+    logger.info("✓ Heartbeat watchdog thread started")
+
+
+def stop_heartbeat_watchdog():
+    """Stop the heartbeat watchdog thread"""
+    global _heartbeat_watchdog_thread
+    
+    if _heartbeat_watchdog_thread is None:
+        return
+    
+    logger.info("Stopping heartbeat watchdog...")
+    _heartbeat_watchdog_stop.set()
+    
+    if _heartbeat_watchdog_thread.is_alive():
+        _heartbeat_watchdog_thread.join(timeout=5)
+    
+    logger.info("Heartbeat watchdog stopped")
 
 
 # HearsAid API (FastAPI) -----------------------------------------------------
@@ -1010,6 +1124,8 @@ async def update_audiobook_status(
             "Audiobook processing heartbeat received%s",
             f": {payload.detail}" if payload.detail else "",
         )
+        # Record heartbeat for watchdog monitoring
+        _record_heartbeat()
         return {
             "status": "acknowledged",
             "action": "heartbeat",
@@ -1017,6 +1133,8 @@ async def update_audiobook_status(
         }
     if status_value == "exited":
         logger.info("Audiobook processor reported exit; scheduling pod shutdown")
+        # Record other activity (exit is not a heartbeat)
+        _record_other_activity()
         background_tasks.add_task(schedule_pod_shutdown, "audiobook_status_exit")
         return {
             "status": "acknowledged",
@@ -1043,6 +1161,9 @@ async def list_audio_files():
 
 @hearsaid_router.post("/audio-upload")
 async def upload_audio(file: UploadFile = File(...)):
+    # Record non-heartbeat activity
+    _record_other_activity()
+    
     if not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file is missing a filename")
 
@@ -1129,10 +1250,17 @@ def start_hearsaid_api_server():
         daemon=True,
     )
     HEARSAID_SERVER_THREAD.start()
+    
+    # Start heartbeat watchdog when API server starts
+    start_heartbeat_watchdog()
+    
     return HEARSAID_SERVER_THREAD
 
 
 def stop_hearsaid_api_server():
+    # Stop heartbeat watchdog
+    stop_heartbeat_watchdog()
+    
     if HEARSAID_SERVER is not None:
         HEARSAID_SERVER.should_exit = True
     if HEARSAID_SERVER_THREAD is not None and HEARSAID_SERVER_THREAD.is_alive():
