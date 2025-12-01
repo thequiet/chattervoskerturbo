@@ -1654,16 +1654,23 @@ def transcribe_vosk_batch_filepath(file_paths_text, sample_rate=24000):
     return batch_result
 
 
-def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None, skip_conversion=None):
+def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None, skip_conversion=None, output_directory=None):
     logger.info(f"Chatterbox TTS started for text: '{text[:100]}{'...' if len(text) > 100 else ''}'")
     start_time = datetime.now()
     
     try:
         # Log parameters
-        logger.info(f"Parameters - exaggeration: {exaggeration}, cfg_weight: {cfg_weight}, temperature: {temperature}, seed: {random_seed}, custom_filename: {output_filename}")
+        logger.info(f"Parameters - exaggeration: {exaggeration}, cfg_weight: {cfg_weight}, temperature: {temperature}, seed: {random_seed}, custom_filename: {output_filename}, output_directory: {output_directory}")
+        
+        # Determine output directory: use custom directory if provided, otherwise use default
+        if output_directory and output_directory.strip():
+            output_dir = output_directory.strip()
+            logger.info(f"Using custom output directory: {output_dir}")
+        else:
+            output_dir = AUDIO_OUTPUT_DIR
+            logger.info(f"Using default output directory: {output_dir}")
         
         # Create output directory if it doesn't exist
-        output_dir = AUDIO_OUTPUT_DIR
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Output directory ensured: {output_dir}")
         
@@ -1925,6 +1932,7 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
                     "temperature": temperature,
                     "random_seed": random_seed,
                     "custom_filename": output_filename,
+                    "output_directory": output_dir,
                     "skip_conversion": skip_conversion
                 },
                 "text_length": len(text),
@@ -1945,9 +1953,9 @@ def chatterbox_clone(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, 
         logger.error(traceback.format_exc())
         return {"error": error_msg}
 
-def chatterbox_clone_gradio(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None, skip_conversion=None):
+def chatterbox_clone_gradio(text, audio_prompt=None, exaggeration=0.5, cfg_weight=0.5, temperature=1.0, random_seed=None, output_filename=None, skip_conversion=None, output_directory=None):
     """Wrapper function for Gradio interface that returns just the audio file path"""
-    result = chatterbox_clone(text, audio_prompt, exaggeration, cfg_weight, temperature, random_seed, output_filename, skip_conversion)
+    result = chatterbox_clone(text, audio_prompt, exaggeration, cfg_weight, temperature, random_seed, output_filename, skip_conversion, output_directory)
     
     if isinstance(result, dict):
         if "error" in result:
@@ -2063,7 +2071,9 @@ try:
             gr.Slider(minimum=0, maximum=1, value=0.5, label="CFG Weight (pacing control)"),
             gr.Slider(minimum=0.1, maximum=2.0, value=1.0, label="Temperature"),
             gr.Number(label="Random Seed", value=None, precision=0),
-            gr.Textbox(label="Output Filename (optional)", placeholder="e.g., my_voice_clone", info="Will be saved as .wav file. If empty, uses audio prompt filename or timestamp.")
+            gr.Textbox(label="Output Filename (optional)", placeholder="e.g., my_voice_clone", info="Will be saved as .wav file. If empty, uses audio prompt filename or timestamp."),
+            gr.Checkbox(label="Skip Audio Conversion", value=None, info="Skip conversion to 24kHz mono 16-bit (use original format). If unchecked, uses environment default."),
+            gr.Textbox(label="Output Directory (optional)", placeholder="e.g., /app/audio/custom", info="Directory to save audio file. If empty, uses default output directory. Directory will be created if it doesn't exist.")
         ],
         outputs=[
             gr.Audio(type="filepath", label="Generated Audio"),
