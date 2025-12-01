@@ -1032,8 +1032,20 @@ def safe_join(base_dir: str, *paths: str) -> str:
     return candidate
 
 
-def safe_extract_zip(zip_path: str, target_dir: str) -> List[str]:
+def safe_extract_zip(zip_path: str, target_dir: str) -> Dict[str, Any]:
+    """Safely extract a zip file to a target directory.
+    
+    Args:
+        zip_path: Path to the zip file.
+        target_dir: Directory to extract files into.
+    
+    Returns:
+        Dict with 'extracted_files', 'overwritten_files', and 'new_files' lists.
+    """
     extracted_files: List[str] = []
+    overwritten_files: List[str] = []
+    new_files: List[str] = []
+    
     with zipfile.ZipFile(zip_path) as archive:
         for member in archive.infolist():
             normalized_name = os.path.normpath(member.filename)
@@ -1045,11 +1057,25 @@ def safe_extract_zip(zip_path: str, target_dir: str) -> List[str]:
             if member.is_dir():
                 os.makedirs(destination_path, exist_ok=True)
                 continue
+            
+            # Check if file exists before extraction
+            file_existed = os.path.exists(destination_path)
+            
             os.makedirs(os.path.dirname(destination_path), exist_ok=True)
             with archive.open(member) as src, open(destination_path, "wb") as dst:
                 shutil.copyfileobj(src, dst)
+            
             extracted_files.append(destination_path)
-    return extracted_files
+            if file_existed:
+                overwritten_files.append(destination_path)
+            else:
+                new_files.append(destination_path)
+    
+    return {
+        "extracted_files": extracted_files,
+        "overwritten_files": overwritten_files,
+        "new_files": new_files,
+    }
 
 
 async def persist_uploaded_file(upload: UploadFile, destination: str) -> int:
@@ -1078,28 +1104,68 @@ def schedule_pod_shutdown(reason: str):
     threading.Thread(target=_shutdown_task, name="hearsaid-shutdown", daemon=True).start()
 
 
-def list_audio_output_files() -> List[Dict[str, Any]]:
-    """Return metadata for files within the audio output directory."""
-    if not os.path.exists(AUDIO_OUTPUT_DIR):
+def list_audio_output_files(directory: Optional[str] = None, recursive: bool = False) -> List[Dict[str, Any]]:
+    """Return metadata for files within the specified directory.
+    
+    Args:
+        directory: Directory to scan. Defaults to AUDIO_OUTPUT_DIR.
+        recursive: If True, recursively scan subdirectories.
+    
+    Returns:
+        List of file metadata dictionaries with name, path, size_bytes, and modified.
+    """
+    scan_dir = directory if directory else AUDIO_OUTPUT_DIR
+    
+    if not os.path.exists(scan_dir):
+        return []
+    
+    if not os.path.isdir(scan_dir):
         return []
 
     entries: List[Dict[str, Any]] = []
-    for entry in os.scandir(AUDIO_OUTPUT_DIR):
-        if not entry.is_file():
-            continue
-        try:
-            stat_info = entry.stat()
-            entries.append(
-                {
-                    "name": entry.name,
-                    "size_bytes": stat_info.st_size,
-                    "modified": datetime.fromtimestamp(stat_info.st_mtime).isoformat() + "Z",
-                }
-            )
-        except FileNotFoundError:
-            # File disappeared between scandir and stat; skip it
-            continue
-    entries.sort(key=lambda item: item["name"].lower())
+    
+    if recursive:
+        # Recursively walk directory tree
+        for root, dirs, files in os.walk(scan_dir):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                try:
+                    stat_info = os.stat(file_path)
+                    # Get relative path from scan directory
+                    rel_path = os.path.relpath(file_path, scan_dir)
+                    entries.append(
+                        {
+                            "name": filename,
+                            "path": file_path,
+                            "relative_path": rel_path,
+                            "size_bytes": stat_info.st_size,
+                            "modified": datetime.fromtimestamp(stat_info.st_mtime).isoformat() + "Z",
+                        }
+                    )
+                except (FileNotFoundError, OSError):
+                    # File disappeared or is inaccessible; skip it
+                    continue
+    else:
+        # Non-recursive scan (original behavior)
+        for entry in os.scandir(scan_dir):
+            if not entry.is_file():
+                continue
+            try:
+                stat_info = entry.stat()
+                entries.append(
+                    {
+                        "name": entry.name,
+                        "path": entry.path,
+                        "relative_path": entry.name,
+                        "size_bytes": stat_info.st_size,
+                        "modified": datetime.fromtimestamp(stat_info.st_mtime).isoformat() + "Z",
+                    }
+                )
+            except (FileNotFoundError, OSError):
+                # File disappeared or is inaccessible; skip it
+                continue
+    
+    entries.sort(key=lambda item: item["relative_path"].lower())
     return entries
 
 
@@ -1146,21 +1212,67 @@ async def update_audiobook_status(
 
 
 @hearsaid_router.get("/audio-files")
-async def list_audio_files():
+async def list_audio_files(
+    directory: Optional[str] = None,
+    recursive: bool = True,
+):
+    """List audio files in a directory.
+    
+    Args:
+        directory: Optional directory path to scan. Defaults to the configured audio output directory.
+        recursive: If true, recursively scan subdirectories. Defaults to true.
+    
+    Returns:
+        JSON response with directory, count, recursive flag, and list of files.
+    """
     try:
-        files = list_audio_output_files()
+        # Use provided directory or default
+        scan_dir = directory.strip() if directory and directory.strip() else AUDIO_OUTPUT_DIR
+        
+        # Validate directory exists
+        if not os.path.exists(scan_dir):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Directory not found: {scan_dir}"
+            )
+        
+        if not os.path.isdir(scan_dir):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Path is not a directory: {scan_dir}"
+            )
+        
+        files = list_audio_output_files(directory=scan_dir, recursive=recursive)
         return {
-            "directory": AUDIO_OUTPUT_DIR,
+            "directory": scan_dir,
+            "recursive": recursive,
             "count": len(files),
             "files": files,
         }
+    except HTTPException:
+        raise
     except Exception as err:
-        logger.error(f"Failed to list audio files: {err}")
-        raise HTTPException(status_code=500, detail="Unable to list audio output files") from err
+        logger.error(f"Failed to list audio files in {directory}: {err}")
+        raise HTTPException(status_code=500, detail="Unable to list audio files") from err
 
 
 @hearsaid_router.post("/audio-upload")
-async def upload_audio(file: UploadFile = File(...)):
+async def upload_audio(
+    file: UploadFile = File(...),
+    directory: Optional[str] = None,
+):
+    """Upload an audio file to the server.
+    
+    Args:
+        file: The audio file to upload (wav, mp3, or zip).
+        directory: Optional directory path to save the file. Must start with '/app'.
+                   If not provided, defaults to the configured audio output directory.
+                   Directory will be created if it doesn't exist.
+                   Existing files with the same name will be overwritten.
+    
+    Returns:
+        JSON response with filename, saved_path, bytes_written, and extracted files for zips.
+    """
     # Record non-heartbeat activity
     _record_other_activity()
     
@@ -1179,8 +1291,41 @@ async def upload_audio(file: UploadFile = File(...)):
             detail="Unsupported file type. Allowed: wav, mp3, zip.",
         )
 
-    os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
-    destination_path = os.path.join(AUDIO_OUTPUT_DIR, original_name)
+    # Determine target directory with validation
+    if directory and directory.strip():
+        target_dir = directory.strip()
+        
+        # Normalize the path to prevent path traversal
+        target_dir = os.path.normpath(target_dir)
+        
+        # Security check: must start with /app
+        if not target_dir.startswith("/app"):
+            raise HTTPException(
+                status_code=400,
+                detail="Directory must start with '/app' for security reasons."
+            )
+        
+        # Additional security: ensure no path traversal escapes /app
+        real_path = os.path.realpath(target_dir)
+        if not real_path.startswith("/app"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid directory path: path traversal detected."
+            )
+        
+        logger.info(f"Using custom upload directory: {target_dir}")
+    else:
+        target_dir = AUDIO_OUTPUT_DIR
+
+    # Create directory if it doesn't exist
+    os.makedirs(target_dir, exist_ok=True)
+    destination_path = os.path.join(target_dir, original_name)
+    
+    # Check if file exists (will be overwritten/merged)
+    file_exists = os.path.exists(destination_path)
+    if file_exists:
+        logger.info(f"File already exists, will be overwritten: {destination_path}")
+    
     logger.info(f"Receiving upload for {original_name} -> {destination_path}")
 
     bytes_written = await persist_uploaded_file(file, destination_path)
@@ -1188,7 +1333,9 @@ async def upload_audio(file: UploadFile = File(...)):
     response: Dict[str, Any] = {
         "filename": original_name,
         "saved_path": destination_path,
+        "directory": target_dir,
         "bytes_written": bytes_written,
+        "overwritten": file_exists,
     }
 
     if extension == ".zip":
@@ -1196,10 +1343,16 @@ async def upload_audio(file: UploadFile = File(...)):
             logger.error("Uploaded file %s is not a valid zip archive", destination_path)
             raise HTTPException(status_code=400, detail="Uploaded file is not a valid zip archive")
         try:
-            extracted_files = safe_extract_zip(destination_path, AUDIO_OUTPUT_DIR)
-            response["unzipped_files"] = extracted_files
+            extraction_result = safe_extract_zip(destination_path, target_dir)
+            response["unzipped_files"] = extraction_result["extracted_files"]
+            response["unzipped_overwritten"] = extraction_result["overwritten_files"]
+            response["unzipped_new"] = extraction_result["new_files"]
             logger.info(
-                "Stored zip %s and extracted %d entries", destination_path, len(extracted_files)
+                "Stored zip %s and extracted %d entries (%d new, %d overwritten)",
+                destination_path,
+                len(extraction_result["extracted_files"]),
+                len(extraction_result["new_files"]),
+                len(extraction_result["overwritten_files"]),
             )
         except Exception as zip_err:
             logger.error(f"Failed to extract {destination_path}: {zip_err}")
