@@ -1229,12 +1229,15 @@ async def list_audio_files(
         # Use provided directory or default
         scan_dir = directory.strip() if directory and directory.strip() else AUDIO_OUTPUT_DIR
         
-        # Validate directory exists
+        # If directory doesn't exist, return empty list (not an error - just no files yet)
         if not os.path.exists(scan_dir):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Directory not found: {scan_dir}"
-            )
+            return {
+                "directory": scan_dir,
+                "recursive": recursive,
+                "count": 0,
+                "files": [],
+                "exists": False,
+            }
         
         if not os.path.isdir(scan_dir):
             raise HTTPException(
@@ -1248,6 +1251,7 @@ async def list_audio_files(
             "recursive": recursive,
             "count": len(files),
             "files": files,
+            "exists": True,
         }
     except HTTPException:
         raise
@@ -1381,6 +1385,9 @@ def start_hearsaid_api_server():
         host=HEARSAID_API_HOST,
         port=HEARSAID_API_PORT,
         log_level="info",
+        limit_max_request_size=2 * 1024 * 1024 * 1024,  # 2GB max request size
+        timeout_keep_alive=300,  # 5 minute keep-alive timeout for large uploads
+        timeout_notify=60,  # 60 second graceful shutdown timeout
     )
     HEARSAID_SERVER = uvicorn.Server(config)
 
@@ -2181,7 +2188,7 @@ try:
             gr.File(
                 file_count="multiple",
                 file_types=["audio"],
-                label="Upload multiple audio files for batch transcription",
+                label="Upload multiple audio files for batch transcription (up to 100 files)",
                 type="filepath"
             ),
             gr.Number(label="Sample Rate", value=24000, precision=0, info="Target sample rate for audio conversion (Hz)")
@@ -2286,7 +2293,8 @@ if __name__ == "__main__":
             server_name="0.0.0.0", 
             server_port=7860,
             show_error=True,
-            quiet=False
+            quiet=False,
+            max_file_size="2gb",  # Allow uploads up to 2GB
         )
         
     except KeyboardInterrupt:
