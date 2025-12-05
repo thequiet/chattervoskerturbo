@@ -1385,9 +1385,7 @@ def start_hearsaid_api_server():
         host=HEARSAID_API_HOST,
         port=HEARSAID_API_PORT,
         log_level="info",
-        limit_max_request_size=2 * 1024 * 1024 * 1024,  # 2GB max request size
         timeout_keep_alive=300,  # 5 minute keep-alive timeout for large uploads
-        timeout_notify=60,  # 60 second graceful shutdown timeout
     )
     HEARSAID_SERVER = uvicorn.Server(config)
 
